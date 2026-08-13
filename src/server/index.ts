@@ -15,6 +15,13 @@ const ALERT_STATES_STORAGE_KEY = "price_alert_states";
 
 const PRICE_SAVE_INTERVAL_MS = 60_000;
 
+const EMAIL = "k.bittner.k@gmail.com";
+
+
+// ======================================================
+// TYPES
+// ======================================================
+
 type FinnhubTrade = {
 	s: string;
 	p: number;
@@ -48,11 +55,6 @@ type AlertZone =
 	| "below"
 	| "above";
 
-type AlertState = {
-	symbol: string;
-	zone: AlertZone;
-};
-
 type ClientMessage =
 	| {
 			type: "set_symbols";
@@ -78,6 +80,61 @@ type ClientMessage =
 			type: "delete_alert";
 			symbol: string;
 	  };
+
+
+// ======================================================
+// GMAIL HELPERS
+// ======================================================
+
+function bytesToBase64(
+	bytes: Uint8Array,
+) {
+	let binary = "";
+
+	const chunkSize =
+		0x8000;
+
+	for (
+		let i = 0;
+		i < bytes.length;
+		i += chunkSize
+	) {
+		const chunk =
+			bytes.subarray(
+				i,
+				Math.min(
+					i + chunkSize,
+					bytes.length,
+				),
+			);
+
+		binary +=
+			String.fromCharCode(
+				...chunk,
+			);
+	}
+
+	return btoa(binary);
+}
+
+
+function toBase64Url(
+	text: string,
+) {
+	const bytes =
+		new TextEncoder()
+			.encode(text);
+
+	return bytesToBase64(bytes)
+		.replace(/\+/g, "-")
+		.replace(/\//g, "_")
+		.replace(/=+$/g, "");
+}
+
+
+// ======================================================
+// DURABLE OBJECT
+// ======================================================
 
 export class Chat extends Server<Env> {
 	static options = {
@@ -118,6 +175,11 @@ export class Chat extends Server<Env> {
 			string,
 			AlertZone
 		>();
+
+	// Ochrana proti několika současným
+	// e-mailům pro stejný ticker.
+	private alertProcessing =
+		new Set<string>();
 
 	private initialized =
 		false;
@@ -236,7 +298,7 @@ export class Chat extends Server<Env> {
 
 
 	// ==================================================
-	// LATEST PRICES STORAGE
+	// LATEST PRICES
 	// ==================================================
 
 	private async loadLatestPrices() {
@@ -408,6 +470,7 @@ export class Chat extends Server<Env> {
 					symbol,
 					{
 						symbol,
+
 						below:
 							typeof alert.below ===
 							"number"
@@ -559,7 +622,170 @@ export class Chat extends Server<Env> {
 
 
 	// ==================================================
-	// NORMALIZE SYMBOLS
+	// GMAIL OAUTH
+	// ==================================================
+
+	private async getGmailAccessToken() {
+		const clientId =
+			this.env.GMAIL_CLIENT_ID;
+
+		const clientSecret =
+			this.env.GMAIL_CLIENT_SECRET;
+
+		const refreshToken =
+			this.env.GMAIL_REFRESH_TOKEN;
+
+
+		if (
+			!clientId ||
+			!clientSecret ||
+			!refreshToken
+		) {
+			throw new Error(
+				"Missing Gmail OAuth secrets.",
+			);
+		}
+
+
+		const response =
+			await fetch(
+				"https://oauth2.googleapis.com/token",
+				{
+					method:
+						"POST",
+
+					headers: {
+						"content-type":
+							"application/x-www-form-urlencoded",
+					},
+
+					body:
+						new URLSearchParams({
+							client_id:
+								clientId,
+
+							client_secret:
+								clientSecret,
+
+							refresh_token:
+								refreshToken,
+
+							grant_type:
+								"refresh_token",
+						}),
+				},
+			);
+
+
+		const data =
+			await response.json() as {
+				access_token?: string;
+				error?: string;
+				error_description?: string;
+			};
+
+
+		if (!response.ok) {
+			throw new Error(
+				`Google OAuth HTTP ${response.status}: ${JSON.stringify(
+					data,
+				)}`,
+			);
+		}
+
+
+		if (
+			!data.access_token
+		) {
+			throw new Error(
+				"Google OAuth nevrátil access token.",
+			);
+		}
+
+
+		return data.access_token;
+	}
+
+
+	// ==================================================
+	// GMAIL SEND
+	// ==================================================
+
+	private async sendEmail(
+		subject: string,
+		text: string,
+	) {
+		const accessToken =
+			await this.getGmailAccessToken();
+
+
+		const email =
+			`From: Stocktrade Alerts <${EMAIL}>\r\n` +
+			`To: ${EMAIL}\r\n` +
+			`Subject: ${subject}\r\n` +
+			`MIME-Version: 1.0\r\n` +
+			`Content-Type: text/plain; charset=UTF-8\r\n` +
+			`Content-Transfer-Encoding: 8bit\r\n` +
+			`\r\n` +
+			text;
+
+
+		const raw =
+			toBase64Url(email);
+
+
+		const response =
+			await fetch(
+				"https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+				{
+					method:
+						"POST",
+
+					headers: {
+						Authorization:
+							`Bearer ${accessToken}`,
+
+						"Content-Type":
+							"application/json",
+					},
+
+					body:
+						JSON.stringify({
+							raw,
+						}),
+				},
+			);
+
+
+		const data =
+			await response.json() as {
+				id?: string;
+				error?: unknown;
+			};
+
+
+		if (!response.ok) {
+			throw new Error(
+				`Gmail API HTTP ${response.status}: ${JSON.stringify(
+					data,
+				)}`,
+			);
+		}
+
+
+		if (!data.id) {
+			throw new Error(
+				"Gmail API nevrátil Message ID.",
+			);
+		}
+
+
+		return data.id;
+	}
+
+
+	// ==================================================
+	// SYMBOL NORMALIZATION
 	// ==================================================
 
 	private normalizeSymbols(
@@ -659,13 +885,14 @@ export class Chat extends Server<Env> {
 
 
 	// ==================================================
-	// SYMBOLS BROADCAST
+	// SYMBOLS
 	// ==================================================
 
 	private broadcastSymbols() {
 		this.broadcast(
 			JSON.stringify({
-				type: "symbols",
+				type:
+					"symbols",
 
 				symbols:
 					Array.from(
@@ -785,10 +1012,6 @@ export class Chat extends Server<Env> {
 			normalized.length ===
 			0
 		) {
-			console.log(
-				"set_symbols ignored: empty symbol list",
-			);
-
 			return;
 		}
 
@@ -801,6 +1024,7 @@ export class Chat extends Server<Env> {
 			new Set(
 				normalized,
 			);
+
 
 		for (
 			const symbol
@@ -818,6 +1042,7 @@ export class Chat extends Server<Env> {
 			}
 		}
 
+
 		for (
 			const symbol
 			of newSymbols
@@ -833,6 +1058,7 @@ export class Chat extends Server<Env> {
 				);
 			}
 		}
+
 
 		this.symbols =
 			newSymbols;
@@ -866,6 +1092,7 @@ export class Chat extends Server<Env> {
 				.trim()
 				.toUpperCase();
 
+
 		if (
 			!this.symbols.has(
 				symbol,
@@ -878,6 +1105,7 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+
 		const below =
 			typeof belowRaw ===
 				"number" &&
@@ -888,6 +1116,7 @@ export class Chat extends Server<Env> {
 				? belowRaw
 				: null;
 
+
 		const above =
 			typeof aboveRaw ===
 				"number" &&
@@ -897,6 +1126,7 @@ export class Chat extends Server<Env> {
 			aboveRaw > 0
 				? aboveRaw
 				: null;
+
 
 		if (
 			below !== null &&
@@ -909,6 +1139,7 @@ export class Chat extends Server<Env> {
 
 			return;
 		}
+
 
 		if (
 			below === null &&
@@ -931,6 +1162,7 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+
 		const alert:
 			PriceAlert = {
 				symbol,
@@ -939,15 +1171,23 @@ export class Chat extends Server<Env> {
 				enabled,
 			};
 
+
 		this.alerts.set(
 			symbol,
 			alert,
 		);
 
+
+		// DŮLEŽITÉ:
+		// Při změně nastavení alertu nastavíme
+		// současnou cenovou zónu jako výchozí.
+		// Samotné uložení alertu tedy neposílá e-mail.
+
 		const latest =
 			this.latestTrades.get(
 				symbol,
 			);
+
 
 		if (latest) {
 			const currentZone =
@@ -960,19 +1200,23 @@ export class Chat extends Server<Env> {
 				symbol,
 				currentZone,
 			);
+
 		} else {
 			this.alertStates.delete(
 				symbol,
 			);
 		}
 
+
 		await this.saveAlerts();
 
 		await this.saveAlertStates();
 
+
 		console.log(
 			`Alert stored for ${symbol}: below=${below}, above=${above}, enabled=${enabled}`,
 		);
+
 
 		this.broadcastAlerts();
 	}
@@ -990,6 +1234,7 @@ export class Chat extends Server<Env> {
 				.trim()
 				.toUpperCase();
 
+
 		this.alerts.delete(
 			symbol,
 		);
@@ -998,20 +1243,23 @@ export class Chat extends Server<Env> {
 			symbol,
 		);
 
+
 		await this.saveAlerts();
 
 		await this.saveAlertStates();
 
+
 		console.log(
 			`Alert deleted: ${symbol}`,
 		);
+
 
 		this.broadcastAlerts();
 	}
 
 
 	// ==================================================
-	// ALERT ENGINE
+	// ALERT ZONE
 	// ==================================================
 
 	private getAlertZone(
@@ -1040,6 +1288,64 @@ export class Chat extends Server<Env> {
 	}
 
 
+	// ==================================================
+	// ALERT EMAIL
+	// ==================================================
+
+	private async sendPriceAlertEmail(
+		alert: PriceAlert,
+		trade: LatestTrade,
+		zone:
+			| "below"
+			| "above",
+	) {
+		const boundary =
+			zone === "below"
+				? alert.below
+				: alert.above;
+
+
+		const directionText =
+			zone === "below"
+				? "klesl pod nastavenou hranici"
+				: "vzrostl nad nastavenou hranici";
+
+
+		const subject =
+			`Stocktrade Alert - ${trade.symbol}`;
+
+
+		const text =
+			"Stocktrade Alerts\n\n" +
+
+			`${trade.symbol} ${directionText}.\n\n` +
+
+			`Aktuální cena: ${trade.price} USD\n` +
+
+			`Hranice: ${boundary} USD\n` +
+
+			`Směr: ${zone.toUpperCase()}\n\n` +
+
+			`Čas trhu: ${new Date(
+				trade.timestamp,
+			).toISOString()}\n` +
+
+			`Odesláno: ${new Date().toISOString()}\n\n` +
+
+			"Stocktrade Live";
+
+
+		return await this.sendEmail(
+			subject,
+			text,
+		);
+	}
+
+
+	// ==================================================
+	// ALERT ENGINE
+	// ==================================================
+
 	private async processPriceAlert(
 		trade: LatestTrade,
 	) {
@@ -1048,6 +1354,7 @@ export class Chat extends Server<Env> {
 				trade.symbol,
 			);
 
+
 		if (
 			!alert ||
 			!alert.enabled
@@ -1055,134 +1362,246 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
-		const newZone =
-			this.getAlertZone(
-				alert,
-				trade.price,
-			);
 
-		const previousZone =
-			this.alertStates.get(
-				trade.symbol,
-			);
-
-
-		// První známý stav pouze uložíme.
-		// Nechceme okamžitě poslat alert
-		// po restartu aplikace.
-
-		if (!previousZone) {
-			this.alertStates.set(
-				trade.symbol,
-				newZone,
-			);
-
-			await this.saveAlertStates();
-
-			console.log(
-				`${trade.symbol}: initial alert zone = ${newZone}`,
-			);
-
-			return;
-		}
-
-
-		// Stejná zóna = žádný nový alert.
+		// Pokud právě pro stejný ticker
+		// probíhá Gmail request, další tick
+		// ho nebude duplikovat.
 
 		if (
-			previousZone ===
-			newZone
+			this.alertProcessing.has(
+				trade.symbol,
+			)
 		) {
 			return;
 		}
 
 
-		// Stav se změnil.
-
-		this.alertStates.set(
+		this.alertProcessing.add(
 			trade.symbol,
-			newZone,
 		);
 
-		await this.saveAlertStates();
+
+		try {
+			const newZone =
+				this.getAlertZone(
+					alert,
+					trade.price,
+				);
 
 
-		// Návrat dovnitř pásma
-		// pouze resetuje ochranu.
+			const previousZone =
+				this.alertStates.get(
+					trade.symbol,
+				);
 
-		if (
-			newZone ===
-			"inside"
-		) {
+
+			// ----------------------------------------------
+			// PRVNÍ STAV
+			// ----------------------------------------------
+			//
+			// První známou zónu jen uložíme.
+			// Po restartu nebo novém alertu
+			// neposíláme okamžitě e-mail.
+
+			if (!previousZone) {
+				this.alertStates.set(
+					trade.symbol,
+					newZone,
+				);
+
+				await this.saveAlertStates();
+
+				console.log(
+					`${trade.symbol}: initial alert zone = ${newZone}`,
+				);
+
+				return;
+			}
+
+
+			// ----------------------------------------------
+			// ZÓNA SE NEZMĚNILA
+			// ----------------------------------------------
+
+			if (
+				previousZone ===
+				newZone
+			) {
+				return;
+			}
+
+
+			// ----------------------------------------------
+			// NÁVRAT DO PÁSMA
+			// ----------------------------------------------
+
+			if (
+				newZone ===
+				"inside"
+			) {
+				this.alertStates.set(
+					trade.symbol,
+					"inside",
+				);
+
+				await this.saveAlertStates();
+
+
+				console.log(
+					`${trade.symbol}: alert reset - price returned inside range`,
+				);
+
+
+				this.broadcast(
+					JSON.stringify({
+						type:
+							"alert_reset",
+
+						symbol:
+							trade.symbol,
+
+						price:
+							trade.price,
+					}),
+				);
+
+
+				return;
+			}
+
+
+			// ----------------------------------------------
+			// NOVÉ PŘEKROČENÍ HRANICE
+			// ----------------------------------------------
+
+			const boundary =
+				newZone ===
+				"below"
+					? alert.below
+					: alert.above;
+
+
+			const alertPayload = {
+				type:
+					"price_alert",
+
+				symbol:
+					trade.symbol,
+
+				zone:
+					newZone,
+
+				price:
+					trade.price,
+
+				boundary,
+
+				timestamp:
+					trade.timestamp,
+			};
+
+
 			console.log(
-				`${trade.symbol}: alert reset - price returned inside range`,
+				"PRICE ALERT TRIGGERED:",
+				JSON.stringify(
+					alertPayload,
+				),
 			);
 
-			this.broadcast(
-				JSON.stringify({
-					type:
-						"alert_reset",
 
-					symbol:
-						trade.symbol,
+			// ==================================================
+			// 1. NEJDŘÍVE GMAIL
+			// ==================================================
+			//
+			// Pokud Gmail selže:
+			// alertStates se NEZMĚNÍ.
+			// Další tick se tedy může pokusit znovu.
 
-					price:
-						trade.price,
-				}),
-			);
+			try {
+				const gmailMessageId =
+					await this.sendPriceAlertEmail(
+						alert,
+						trade,
+						newZone,
+					);
 
-			return;
-		}
+
+				console.log(
+					"EMAIL ALERT SENT:",
+					JSON.stringify(
+						alertPayload,
+					),
+				);
 
 
-		// ==================================================
-		// NOVÝ ALERT
-		// ==================================================
+				console.log(
+					"Gmail Message ID:",
+					gmailMessageId,
+				);
 
-		const boundary =
-			newZone ===
-			"below"
-				? alert.below
-				: alert.above;
 
-		const alertPayload = {
-			type:
-				"price_alert",
+				// ==================================================
+				// 2. GMAIL USPĚL → TEPRVE TEĎ ULOŽÍME ZÓNU
+				// ==================================================
 
-			symbol:
+				this.alertStates.set(
+					trade.symbol,
+					newZone,
+				);
+
+
+				await this.saveAlertStates();
+
+
+				// A až potom oznámíme alert klientovi.
+
+				this.broadcast(
+					JSON.stringify(
+						alertPayload,
+					),
+				);
+
+			} catch (error) {
+				console.error(
+					"EMAIL ALERT ERROR:",
+					error instanceof Error
+						? error.message
+						: String(error),
+				);
+
+
+				this.broadcast(
+					JSON.stringify({
+						type:
+							"alert_email_error",
+
+						symbol:
+							trade.symbol,
+
+						price:
+							trade.price,
+
+						zone:
+							newZone,
+
+						message:
+							error instanceof Error
+								? error.message
+								: String(
+										error,
+									),
+					}),
+				);
+
+
+				// Záměrně zde NEMĚNÍME alertStates.
+			}
+
+		} finally {
+			this.alertProcessing.delete(
 				trade.symbol,
-
-			zone:
-				newZone,
-
-			price:
-				trade.price,
-
-			boundary,
-
-			timestamp:
-				trade.timestamp,
-		};
-
-
-		console.log(
-			"PRICE ALERT TRIGGERED:",
-			JSON.stringify(
-				alertPayload,
-			),
-		);
-
-
-		this.broadcast(
-			JSON.stringify(
-				alertPayload,
-			),
-		);
-
-
-		// ==================================================
-		// EMAIL BUDE DOPLNĚN V DALŠÍM KROKU
-		// ==================================================
+			);
+		}
 	}
 
 
@@ -1197,6 +1616,7 @@ export class Chat extends Server<Env> {
 				this.finnhubSocket
 					.readyState ===
 					WebSocket.OPEN ||
+
 				this.finnhubSocket
 					.readyState ===
 					WebSocket.CONNECTING
@@ -1205,14 +1625,17 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+
 		const apiKey =
 			this.env
 				.FINNHUB_API_KEY;
+
 
 		if (!apiKey) {
 			console.error(
 				"FINNHUB_API_KEY is missing",
 			);
+
 
 			this.broadcast(
 				JSON.stringify({
@@ -1227,12 +1650,15 @@ export class Chat extends Server<Env> {
 				}),
 			);
 
+
 			return;
 		}
+
 
 		console.log(
 			"Connecting to Finnhub...",
 		);
+
 
 		const ws =
 			new WebSocket(
@@ -1241,9 +1667,14 @@ export class Chat extends Server<Env> {
 				)}`,
 			);
 
+
 		this.finnhubSocket =
 			ws;
 
+
+		// ----------------------------------------------
+		// OPEN
+		// ----------------------------------------------
 
 		ws.addEventListener(
 			"open",
@@ -1252,7 +1683,9 @@ export class Chat extends Server<Env> {
 					"Finnhub WebSocket connected",
 				);
 
+
 				this.subscribeAll();
+
 
 				this.broadcast(
 					JSON.stringify({
@@ -1272,6 +1705,7 @@ export class Chat extends Server<Env> {
 					}),
 				);
 
+
 				this.broadcastSymbols();
 
 				this.broadcastSnapshot();
@@ -1280,6 +1714,10 @@ export class Chat extends Server<Env> {
 			},
 		);
 
+
+		// ----------------------------------------------
+		// MESSAGE
+		// ----------------------------------------------
 
 		ws.addEventListener(
 			"message",
@@ -1359,6 +1797,7 @@ export class Chat extends Server<Env> {
 							);
 						}
 
+
 						return;
 					}
 
@@ -1373,6 +1812,7 @@ export class Chat extends Server<Env> {
 								message,
 						);
 
+
 						this.broadcast(
 							JSON.stringify({
 								type:
@@ -1383,6 +1823,7 @@ export class Chat extends Server<Env> {
 									"Unknown Finnhub error",
 							}),
 						);
+
 
 						return;
 					}
@@ -1403,6 +1844,10 @@ export class Chat extends Server<Env> {
 		);
 
 
+		// ----------------------------------------------
+		// CLOSE
+		// ----------------------------------------------
+
 		ws.addEventListener(
 			"close",
 			(event) => {
@@ -1410,8 +1855,10 @@ export class Chat extends Server<Env> {
 					`Finnhub WebSocket closed: ${event.code} ${event.reason}`,
 				);
 
+
 				this.finnhubSocket =
 					null;
+
 
 				this.broadcast(
 					JSON.stringify({
@@ -1431,10 +1878,15 @@ export class Chat extends Server<Env> {
 					}),
 				);
 
+
 				this.scheduleReconnect();
 			},
 		);
 
+
+		// ----------------------------------------------
+		// ERROR
+		// ----------------------------------------------
 
 		ws.addEventListener(
 			"error",
@@ -1459,9 +1911,11 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+
 		console.log(
 			"Finnhub reconnect scheduled in 5 seconds",
 		);
+
 
 		this.reconnectTimer =
 			setTimeout(
@@ -1580,6 +2034,7 @@ export class Chat extends Server<Env> {
 			) {
 				await this.loadState();
 
+
 				connection.send(
 					JSON.stringify({
 						type:
@@ -1595,6 +2050,7 @@ export class Chat extends Server<Env> {
 					}),
 				);
 
+
 				return;
 			}
 
@@ -1605,9 +2061,11 @@ export class Chat extends Server<Env> {
 			) {
 				await this.loadState();
 
+
 				this.sendSnapshot(
 					connection,
 				);
+
 
 				return;
 			}
@@ -1619,9 +2077,11 @@ export class Chat extends Server<Env> {
 			) {
 				await this.loadState();
 
+
 				this.sendAlerts(
 					connection,
 				);
+
 
 				return;
 			}
@@ -1638,6 +2098,7 @@ export class Chat extends Server<Env> {
 					message.enabled ??
 						true,
 				);
+
 
 				return;
 			}
