@@ -1,8 +1,13 @@
 import { createRoot } from "react-dom/client";
 import { usePartySocket } from "partysocket/react";
-import React, { useMemo, useState } from "react";
+import React, {
+	useEffect,
+	useMemo,
+	useState,
+} from "react";
 
-const SYMBOLS = ["AAPL", "NVDA", "MSFT"];
+const DEFAULT_SYMBOLS = ["AAPL", "NVDA", "MSFT"];
+const DEFAULT_MAX_SYMBOLS = 40;
 
 type StockData = {
 	symbol: string;
@@ -23,11 +28,43 @@ type TradeMessage = {
 
 type StatusMessage = {
 	type: "status";
-	status: "connected" | "connecting" | "disconnected";
+	status:
+		| "connected"
+		| "connecting"
+		| "disconnected"
+		| "error";
 	symbols?: string[];
+	maxSymbols?: number;
+	message?: string;
 };
 
-type ServerMessage = TradeMessage | StatusMessage;
+type SymbolsMessage = {
+	type: "symbols";
+	symbols: string[];
+	maxSymbols: number;
+};
+
+type FinnhubErrorMessage = {
+	type: "finnhub_error";
+	message: string;
+};
+
+type ServerMessage =
+	| TradeMessage
+	| StatusMessage
+	| SymbolsMessage
+	| FinnhubErrorMessage;
+
+function createEmptyStock(symbol: string): StockData {
+	return {
+		symbol,
+		price: null,
+		volume: null,
+		timestamp: null,
+		firstPrice: null,
+		history: [],
+	};
+}
 
 function formatPrice(price: number | null) {
 	if (price === null) return "—";
@@ -37,14 +74,29 @@ function formatPrice(price: number | null) {
 function formatTime(timestamp: number | null) {
 	if (!timestamp) return "—";
 
-	return new Date(timestamp).toLocaleTimeString("cs-CZ", {
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-	});
+	return new Date(timestamp).toLocaleTimeString(
+		"cs-CZ",
+		{
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+		},
+	);
 }
 
-function MiniChart({ values }: { values: number[] }) {
+function normalizeSymbol(value: string) {
+	return value.trim().toUpperCase();
+}
+
+function validSymbol(value: string) {
+	return /^[A-Z0-9.\-:]{1,20}$/.test(value);
+}
+
+function MiniChart({
+	values,
+}: {
+	values: number[];
+}) {
 	if (values.length < 2) {
 		return (
 			<div
@@ -73,7 +125,8 @@ function MiniChart({ values }: { values: number[] }) {
 		.map((value, index) => {
 			const x =
 				padding +
-				(index / Math.max(values.length - 1, 1)) *
+				(index /
+					Math.max(values.length - 1, 1)) *
 					(width - padding * 2);
 
 			const y =
@@ -87,7 +140,12 @@ function MiniChart({ values }: { values: number[] }) {
 		.join(" ");
 
 	return (
-		<div style={{ width: "100%", overflow: "hidden" }}>
+		<div
+			style={{
+				width: "100%",
+				overflow: "hidden",
+			}}
+		>
 			<svg
 				viewBox={`0 0 ${width} ${height}`}
 				style={{
@@ -119,34 +177,62 @@ function MiniChart({ values }: { values: number[] }) {
 }
 
 function App() {
-	const [selectedSymbol, setSelectedSymbol] = useState("AAPL");
+	const [symbols, setSymbols] =
+		useState<string[]>(DEFAULT_SYMBOLS);
 
-	const [connectionStatus, setConnectionStatus] =
-		useState<"connected" | "connecting" | "disconnected">("connecting");
+	const [maxSymbols, setMaxSymbols] =
+		useState(DEFAULT_MAX_SYMBOLS);
 
-	const [stocks, setStocks] = useState<Record<string, StockData>>(() => {
-		const initial: Record<string, StockData> = {};
+	const [selectedSymbol, setSelectedSymbol] =
+		useState("AAPL");
 
-		for (const symbol of SYMBOLS) {
-			initial[symbol] = {
-				symbol,
-				price: null,
-				volume: null,
-				timestamp: null,
-				firstPrice: null,
-				history: [],
-			};
-		}
+	const [newSymbol, setNewSymbol] = useState("");
 
-		return initial;
-	});
+	const [watchlistError, setWatchlistError] =
+		useState<string | null>(null);
 
-	usePartySocket({
+	const [
+		connectionStatus,
+		setConnectionStatus,
+	] = useState<
+		| "connected"
+		| "connecting"
+		| "disconnected"
+		| "error"
+	>("connecting");
+
+	const [serverError, setServerError] =
+		useState<string | null>(null);
+
+	const [stocks, setStocks] = useState<
+		Record<string, StockData>
+	>(() => {
+			const initial: Record<
+				string,
+				StockData
+			> = {};
+
+			for (const symbol of DEFAULT_SYMBOLS) {
+				initial[symbol] =
+					createEmptyStock(symbol);
+			}
+
+			return initial;
+		});
+
+	const socket = usePartySocket({
 		party: "chat",
 		room: "stocks",
 
 		onOpen: () => {
 			setConnectionStatus("connecting");
+			setServerError(null);
+
+			socket.send(
+				JSON.stringify({
+					type: "get_symbols",
+				}),
+			);
 		},
 
 		onClose: () => {
@@ -160,23 +246,66 @@ function App() {
 				) as ServerMessage;
 
 				if (message.type === "status") {
-					setConnectionStatus(message.status);
+					setConnectionStatus(
+						message.status,
+					);
+
+					if (message.maxSymbols) {
+						setMaxSymbols(
+							message.maxSymbols,
+						);
+					}
+
+					if (message.symbols) {
+						applyServerSymbols(
+							message.symbols,
+						);
+					}
+
+					if (message.message) {
+						setServerError(
+							message.message,
+						);
+					}
+
+					return;
+				}
+
+				if (message.type === "symbols") {
+					setMaxSymbols(
+						message.maxSymbols,
+					);
+
+					applyServerSymbols(
+						message.symbols,
+					);
+
+					return;
+				}
+
+				if (
+					message.type ===
+					"finnhub_error"
+				) {
+					setServerError(
+						message.message,
+					);
 					return;
 				}
 
 				if (message.type === "trade") {
-					setConnectionStatus("connected");
+					setConnectionStatus(
+						"connected",
+					);
 
 					setStocks((previous) => {
 						const old =
-							previous[message.symbol] ?? {
-								symbol: message.symbol,
-								price: null,
-								volume: null,
-								timestamp: null,
-								firstPrice: null,
-								history: [],
-							};
+							previous[
+								message.symbol
+							] ??
+							createEmptyStock(
+								message.symbol,
+							);
 
 						const history = [
 							...old.history,
@@ -188,9 +317,12 @@ function App() {
 
 							[message.symbol]: {
 								...old,
-								price: message.price,
-								volume: message.volume,
-								timestamp: message.timestamp,
+								price:
+									message.price,
+								volume:
+									message.volume,
+								timestamp:
+									message.timestamp,
 								firstPrice:
 									old.firstPrice ??
 									message.price,
@@ -208,12 +340,48 @@ function App() {
 		},
 	});
 
-	const selected = stocks[selectedSymbol];
+	function applyServerSymbols(
+		nextSymbols: string[],
+	) {
+		if (!nextSymbols.length) {
+			return;
+		}
+
+		setSymbols(nextSymbols);
+
+		setStocks((previous) => {
+			const updated = {
+				...previous,
+			};
+
+			for (const symbol of nextSymbols) {
+				if (!updated[symbol]) {
+					updated[symbol] =
+						createEmptyStock(symbol);
+				}
+			}
+
+			return updated;
+		});
+	}
+
+	useEffect(() => {
+		if (
+			symbols.length > 0 &&
+			!symbols.includes(selectedSymbol)
+		) {
+			setSelectedSymbol(symbols[0]);
+		}
+	}, [symbols, selectedSymbol]);
+
+	const selected =
+		stocks[selectedSymbol] ??
+		createEmptyStock(selectedSymbol);
 
 	const change = useMemo(() => {
 		if (
-			!selected?.price ||
-			!selected.firstPrice
+			selected.price === null ||
+			selected.firstPrice === null
 		) {
 			return {
 				value: null,
@@ -239,6 +407,124 @@ function App() {
 	const positive =
 		change.value !== null &&
 		change.value >= 0;
+
+	function sendSymbols(
+		nextSymbols: string[],
+	) {
+		socket.send(
+			JSON.stringify({
+				type: "set_symbols",
+				symbols: nextSymbols,
+			}),
+		);
+	}
+
+	function addSymbol() {
+		setWatchlistError(null);
+
+		const symbol =
+			normalizeSymbol(newSymbol);
+
+		if (!symbol) {
+			return;
+		}
+
+		if (!validSymbol(symbol)) {
+			setWatchlistError(
+				"Neplatný ticker.",
+			);
+			return;
+		}
+
+		if (symbols.includes(symbol)) {
+			setWatchlistError(
+				`${symbol} už ve watchlistu je.`,
+			);
+			return;
+		}
+
+		if (
+			symbols.length >= maxSymbols
+		) {
+			setWatchlistError(
+				`Maximum je ${maxSymbols} tickerů.`,
+			);
+			return;
+		}
+
+		const nextSymbols = [
+			...symbols,
+			symbol,
+		];
+
+		setSymbols(nextSymbols);
+
+		setStocks((previous) => ({
+			...previous,
+			[symbol]:
+				previous[symbol] ??
+				createEmptyStock(symbol),
+		}));
+
+		setSelectedSymbol(symbol);
+		setNewSymbol("");
+
+		sendSymbols(nextSymbols);
+	}
+
+	function removeSymbol(
+		symbolToRemove: string,
+	) {
+		setWatchlistError(null);
+
+		if (symbols.length <= 1) {
+			setWatchlistError(
+				"Ve watchlistu musí zůstat alespoň jeden ticker.",
+			);
+			return;
+		}
+
+		const nextSymbols =
+			symbols.filter(
+				(symbol) =>
+					symbol !==
+					symbolToRemove,
+			);
+
+		setSymbols(nextSymbols);
+
+		if (
+			selectedSymbol ===
+			symbolToRemove
+		) {
+			setSelectedSymbol(
+				nextSymbols[0],
+			);
+		}
+
+		sendSymbols(nextSymbols);
+	}
+
+	const statusColor =
+		connectionStatus === "connected"
+			? "#22c55e"
+			: connectionStatus ===
+				  "disconnected"
+				? "#ef4444"
+				: connectionStatus === "error"
+					? "#ef4444"
+					: "#f59e0b";
+
+	const statusText =
+		connectionStatus === "connected"
+			? "LIVE"
+			: connectionStatus ===
+				  "connecting"
+				? "CONNECTING"
+				: connectionStatus ===
+					  "error"
+					? "ERROR"
+					: "DISCONNECTED";
 
 	return (
 		<div
@@ -279,32 +565,19 @@ function App() {
 							color: "#64748b",
 						}}
 					>
-						Finnhub realtime market feed
+						Finnhub realtime
+						market feed
 					</div>
 				</div>
 
 				<div
 					style={{
 						fontSize: 13,
-						fontWeight: 600,
-						color:
-							connectionStatus ===
-							"connected"
-								? "#22c55e"
-								: connectionStatus ===
-									  "disconnected"
-									? "#ef4444"
-									: "#f59e0b",
+						fontWeight: 700,
+						color: statusColor,
 					}}
 				>
-					●{" "}
-					{connectionStatus ===
-					"connected"
-						? "LIVE"
-						: connectionStatus ===
-							  "connecting"
-							? "CONNECTING"
-							: "DISCONNECTED"}
+					● {statusText}
 				</div>
 			</header>
 
@@ -312,7 +585,7 @@ function App() {
 				style={{
 					display: "grid",
 					gridTemplateColumns:
-						"260px minmax(0, 1fr) 300px",
+						"280px minmax(0, 1fr) 300px",
 					minHeight:
 						"calc(100vh - 64px)",
 				}}
@@ -323,90 +596,256 @@ function App() {
 							"1px solid #1e293b",
 						background: "#0b1120",
 						padding: 18,
+						overflowY: "auto",
 					}}
 				>
 					<div
 						style={{
-							fontSize: 12,
-							fontWeight: 700,
-							color: "#64748b",
-							letterSpacing: 1,
+							display: "flex",
+							alignItems:
+								"center",
+							justifyContent:
+								"space-between",
 							marginBottom: 14,
 						}}
 					>
-						WATCHLIST
+						<div
+							style={{
+								fontSize: 12,
+								fontWeight: 700,
+								color: "#64748b",
+								letterSpacing: 1,
+							}}
+						>
+							WATCHLIST
+						</div>
+
+						<div
+							style={{
+								fontSize: 11,
+								fontWeight: 700,
+								color: "#94a3b8",
+							}}
+						>
+							{symbols.length} /{" "}
+							{maxSymbols}
+						</div>
 					</div>
 
-					{SYMBOLS.map((symbol) => {
-						const stock =
-							stocks[symbol];
-
-						const selectedRow =
-							symbol ===
-							selectedSymbol;
-
-						return (
-							<button
-								key={symbol}
-								onClick={() =>
-									setSelectedSymbol(
-										symbol,
-									)
+					<div
+						style={{
+							display: "flex",
+							gap: 6,
+							marginBottom: 8,
+						}}
+					>
+						<input
+							value={newSymbol}
+							onChange={(event) =>
+								setNewSymbol(
+									event.target
+										.value,
+								)
+							}
+							onKeyDown={(event) => {
+								if (
+									event.key ===
+									"Enter"
+								) {
+									event.preventDefault();
+									addSymbol();
 								}
-								style={{
-									width: "100%",
-									border: "none",
-									borderRadius: 8,
-									background:
-										selectedRow
-											? "#1e293b"
-											: "transparent",
-									color: "#e2e8f0",
-									padding:
-										"12px 10px",
-									marginBottom: 6,
-									cursor: "pointer",
-									textAlign: "left",
-								}}
-							>
+							}}
+							placeholder="TSLA"
+							maxLength={20}
+							style={{
+								flex: 1,
+								minWidth: 0,
+								background:
+									"#020617",
+								border:
+									"1px solid #334155",
+								color: "#e2e8f0",
+								borderRadius: 7,
+								padding:
+									"9px 10px",
+								fontWeight: 700,
+								textTransform:
+									"uppercase",
+								outline: "none",
+							}}
+						/>
+
+						<button
+							onClick={addSymbol}
+							disabled={
+								symbols.length >=
+								maxSymbols
+							}
+							style={{
+								border: "none",
+								borderRadius: 7,
+								background:
+									"#2563eb",
+								color: "white",
+								fontWeight: 800,
+								padding:
+									"0 12px",
+								cursor:
+									symbols.length >=
+									maxSymbols
+										? "not-allowed"
+										: "pointer",
+								opacity:
+									symbols.length >=
+									maxSymbols
+										? 0.5
+										: 1,
+							}}
+						>
+							+
+						</button>
+					</div>
+
+					{watchlistError && (
+						<div
+							style={{
+								fontSize: 11,
+								color: "#f87171",
+								marginBottom: 10,
+								lineHeight: 1.4,
+							}}
+						>
+							{watchlistError}
+						</div>
+					)}
+
+					{symbols.map(
+						(symbol) => {
+							const stock =
+								stocks[
+									symbol
+								] ??
+								createEmptyStock(
+									symbol,
+								);
+
+							const selectedRow =
+								symbol ===
+								selectedSymbol;
+
+							return (
 								<div
+									key={
+										symbol
+									}
 									style={{
-										display:
-											"flex",
-										justifyContent:
-											"space-between",
-										alignItems:
-											"center",
+										position:
+											"relative",
+										marginBottom: 6,
 									}}
 								>
-									<strong>
-										{symbol}
-									</strong>
+									<button
+										onClick={() =>
+											setSelectedSymbol(
+												symbol,
+											)
+										}
+										style={{
+											width: "100%",
+											border: "none",
+											borderRadius: 8,
+											background:
+												selectedRow
+													? "#1e293b"
+													: "transparent",
+											color:
+												"#e2e8f0",
+											padding:
+												"12px 34px 12px 10px",
+											cursor:
+												"pointer",
+											textAlign:
+												"left",
+										}}
+									>
+										<div
+											style={{
+												display:
+													"flex",
+												justifyContent:
+													"space-between",
+												alignItems:
+													"center",
+											}}
+										>
+											<strong>
+												{
+													symbol
+												}
+											</strong>
 
-									<span>
-										{stock.price ===
-										null
-											? "—"
-											: stock.price.toFixed(
-													2,
-												)}
-									</span>
-								</div>
+											<span
+												style={{
+													fontWeight: 700,
+												}}
+											>
+												{stock.price ===
+												null
+													? "—"
+													: stock.price.toFixed(
+															2,
+														)}
+											</span>
+										</div>
 
-								<div
-									style={{
-										fontSize: 11,
-										color: "#64748b",
-										marginTop: 3,
-									}}
-								>
-									{formatTime(
-										stock.timestamp,
-									)}
+										<div
+											style={{
+												fontSize: 11,
+												color:
+													"#64748b",
+												marginTop: 3,
+											}}
+										>
+											{formatTime(
+												stock.timestamp,
+											)}
+										</div>
+									</button>
+
+									<button
+										onClick={() =>
+											removeSymbol(
+												symbol,
+											)
+										}
+										title={`Odebrat ${symbol}`}
+										style={{
+											position:
+												"absolute",
+											right: 7,
+											top: 8,
+											width: 23,
+											height: 23,
+											border:
+												"none",
+											borderRadius: 6,
+											background:
+												"transparent",
+											color:
+												"#64748b",
+											cursor:
+												"pointer",
+											fontSize: 16,
+											lineHeight: 1,
+										}}
+									>
+										×
+									</button>
 								</div>
-							</button>
-						);
-					})}
+							);
+						},
+					)}
 				</aside>
 
 				<main
@@ -415,6 +854,26 @@ function App() {
 						minWidth: 0,
 					}}
 				>
+					{serverError && (
+						<div
+							style={{
+								background:
+									"#450a0a",
+								border:
+									"1px solid #7f1d1d",
+								color: "#fecaca",
+								borderRadius: 8,
+								padding:
+									"10px 14px",
+								marginBottom: 18,
+								fontSize: 13,
+							}}
+						>
+							Finnhub:{" "}
+							{serverError}
+						</div>
+					)}
+
 					<div
 						style={{
 							display: "flex",
@@ -433,7 +892,7 @@ function App() {
 									marginBottom: 6,
 								}}
 							>
-								NASDAQ
+								MARKET
 							</div>
 
 							<h1
@@ -442,7 +901,9 @@ function App() {
 									margin: 0,
 								}}
 							>
-								{selectedSymbol}
+								{
+									selectedSymbol
+								}
 							</h1>
 						</div>
 
@@ -458,8 +919,7 @@ function App() {
 								}}
 							>
 								{formatPrice(
-									selected?.price ??
-										null,
+									selected.price,
 								)}
 							</div>
 
@@ -480,7 +940,11 @@ function App() {
 								{change.value ===
 								null
 									? "Čekám na data"
-									: `${positive ? "+" : ""}${change.value.toFixed(2)} (${positive ? "+" : ""}${change.percent?.toFixed(2)}%)`}
+									: `${positive ? "+" : ""}${change.value.toFixed(
+											2,
+										)} (${positive ? "+" : ""}${change.percent?.toFixed(
+											2,
+										)}%)`}
 							</div>
 						</div>
 					</div>
@@ -493,15 +957,17 @@ function App() {
 							background: "#0f172a",
 							padding: 20,
 							color:
-								positive
-									? "#22c55e"
-									: "#ef4444",
+								change.value ===
+								null
+									? "#64748b"
+									: positive
+										? "#22c55e"
+										: "#ef4444",
 						}}
 					>
 						<MiniChart
 							values={
-								selected?.history ??
-								[]
+								selected.history
 							}
 						/>
 					</section>
@@ -516,35 +982,60 @@ function App() {
 						}}
 					>
 						<div style={statBox}>
-							<div style={statLabel}>
+							<div
+								style={
+									statLabel
+								}
+							>
 								LAST PRICE
 							</div>
-							<div style={statValue}>
+
+							<div
+								style={
+									statValue
+								}
+							>
 								{formatPrice(
-									selected?.price ??
-										null,
+									selected.price,
 								)}
 							</div>
 						</div>
 
 						<div style={statBox}>
-							<div style={statLabel}>
+							<div
+								style={
+									statLabel
+								}
+							>
 								LAST VOLUME
 							</div>
-							<div style={statValue}>
-								{selected?.volume ??
+
+							<div
+								style={
+									statValue
+								}
+							>
+								{selected.volume ??
 									"—"}
 							</div>
 						</div>
 
 						<div style={statBox}>
-							<div style={statLabel}>
+							<div
+								style={
+									statLabel
+								}
+							>
 								LAST TICK
 							</div>
-							<div style={statValue}>
+
+							<div
+								style={
+									statValue
+								}
+							>
 								{formatTime(
-									selected?.timestamp ??
-										null,
+									selected.timestamp,
 								)}
 							</div>
 						</div>
@@ -575,10 +1066,23 @@ function App() {
 						style={{
 							fontSize: 24,
 							fontWeight: 800,
-							marginBottom: 20,
+							marginBottom: 6,
 						}}
 					>
 						{selectedSymbol}
+					</div>
+
+					<div
+						style={{
+							fontSize: 18,
+							fontWeight: 700,
+							color: "#94a3b8",
+							marginBottom: 20,
+						}}
+					>
+						{formatPrice(
+							selected.price,
+						)}
 					</div>
 
 					<button
@@ -654,4 +1158,6 @@ const tradeButton: React.CSSProperties = {
 };
 
 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(
+	document.getElementById("root")!,
+).render(<App />);
