@@ -5,76 +5,155 @@ import {
 	routePartykitRequest,
 } from "partyserver";
 
-import type { ChatMessage, Message } from "../shared";
+const SYMBOLS = ["AAPL", "NVDA", "MSFT"];
+
+type FinnhubTrade = {
+	s: string;
+	p: number;
+	v: number;
+	t: number;
+	c?: string[];
+};
+
+type FinnhubMessage = {
+	type: string;
+	data?: FinnhubTrade[];
+};
 
 export class Chat extends Server<Env> {
 	static options = { hibernate: true };
 
-	messages = [] as ChatMessage[];
-
-	broadcastMessage(message: Message, exclude?: string[]) {
-		this.broadcast(JSON.stringify(message), exclude);
-	}
+	private finnhubSocket: WebSocket | null = null;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 	onStart() {
-		// this is where you can initialize things that need to be done before the server starts
-		// for example, load previous messages from a database or a service
+		this.connectFinnhub();
+	}
 
-		// create the messages table if it doesn't exist
-		this.ctx.storage.sql.exec(
-			`CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT, role TEXT, content TEXT)`,
+	private connectFinnhub() {
+		if (
+			this.finnhubSocket &&
+			(this.finnhubSocket.readyState === WebSocket.OPEN ||
+				this.finnhubSocket.readyState === WebSocket.CONNECTING)
+		) {
+			return;
+		}
+
+		const apiKey = this.env.FINNHUB_API_KEY;
+
+		if (!apiKey) {
+			console.error("FINNHUB_API_KEY is missing");
+			return;
+		}
+
+		console.log("Connecting to Finnhub...");
+
+		const ws = new WebSocket(
+			`wss://ws.finnhub.io?token=${encodeURIComponent(apiKey)}`,
 		);
 
-		// load the messages from the database
-		this.messages = this.ctx.storage.sql
-			.exec(`SELECT * FROM messages`)
-			.toArray() as ChatMessage[];
+		this.finnhubSocket = ws;
+
+		ws.addEventListener("open", () => {
+			console.log("Finnhub WebSocket connected");
+
+			for (const symbol of SYMBOLS) {
+				ws.send(
+					JSON.stringify({
+						type: "subscribe",
+						symbol,
+					}),
+				);
+			}
+
+			this.broadcast(
+				JSON.stringify({
+					type: "status",
+					status: "connected",
+					symbols: SYMBOLS,
+				}),
+			);
+		});
+
+		ws.addEventListener("message", (event) => {
+			try {
+				const message = JSON.parse(event.data as string) as FinnhubMessage;
+
+				if (message.type !== "trade" || !message.data) {
+					return;
+				}
+
+				for (const trade of message.data) {
+					const payload = {
+						type: "trade",
+						symbol: trade.s,
+						price: trade.p,
+						volume: trade.v,
+						timestamp: trade.t,
+						conditions: trade.c ?? [],
+					};
+
+					console.log(
+						`${payload.symbol}: ${payload.price} volume=${payload.volume}`,
+					);
+
+					this.broadcast(JSON.stringify(payload));
+				}
+			} catch (error) {
+				console.error("Finnhub message error:", error);
+			}
+		});
+
+		ws.addEventListener("close", (event) => {
+			console.log(
+				`Finnhub WebSocket closed: ${event.code} ${event.reason}`,
+			);
+
+			this.finnhubSocket = null;
+
+			this.broadcast(
+				JSON.stringify({
+					type: "status",
+					status: "disconnected",
+				}),
+			);
+
+			this.scheduleReconnect();
+		});
+
+		ws.addEventListener("error", (event) => {
+			console.error("Finnhub WebSocket error:", event);
+		});
+	}
+
+	private scheduleReconnect() {
+		if (this.reconnectTimer) {
+			return;
+		}
+
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
+			this.connectFinnhub();
+		}, 5000);
 	}
 
 	onConnect(connection: Connection) {
 		connection.send(
 			JSON.stringify({
-				type: "all",
-				messages: this.messages,
-			} satisfies Message),
+				type: "status",
+				status:
+					this.finnhubSocket?.readyState === WebSocket.OPEN
+						? "connected"
+						: "connecting",
+				symbols: SYMBOLS,
+			}),
 		);
+
+		this.connectFinnhub();
 	}
 
-	saveMessage(message: ChatMessage) {
-		// check if the message already exists
-		const existingMessage = this.messages.find((m) => m.id === message.id);
-		if (existingMessage) {
-			this.messages = this.messages.map((m) => {
-				if (m.id === message.id) {
-					return message;
-				}
-				return m;
-			});
-		} else {
-			this.messages.push(message);
-		}
-
-		// Use parameterized queries to prevent SQL injection
-		this.ctx.storage.sql.exec(
-			`INSERT INTO messages (id, user, role, content) VALUES (?, ?, ?, ?)
-			 ON CONFLICT (id) DO UPDATE SET content = ?`,
-			message.id,
-			message.user,
-			message.role,
-			message.content,
-			message.content,
-		);
-	}
-
-	onMessage(connection: Connection, message: WSMessage) {
-		// let's broadcast the raw message to everyone else
-		this.broadcast(message);
-
-		// let's update our local messages store
-		const parsed = JSON.parse(message as string) as Message;
-		if (parsed.type === "add" || parsed.type === "update") {
-			this.saveMessage(parsed);
-		}
+	onMessage(_connection: Connection, message: WSMessage) {
+		console.log("Client message:", message);
 	}
 }
 
