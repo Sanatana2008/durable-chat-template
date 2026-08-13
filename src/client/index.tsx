@@ -9,6 +9,11 @@ import React, {
 const DEFAULT_SYMBOLS = ["AAPL", "NVDA", "MSFT"];
 const DEFAULT_MAX_SYMBOLS = 40;
 
+
+// ======================================================
+// TYPES
+// ======================================================
+
 type StockData = {
 	symbol: string;
 	price: number | null;
@@ -16,6 +21,13 @@ type StockData = {
 	timestamp: number | null;
 	firstPrice: number | null;
 	history: number[];
+};
+
+type PriceAlert = {
+	symbol: string;
+	below: number | null;
+	above: number | null;
+	enabled: boolean;
 };
 
 type TradeMessage = {
@@ -56,6 +68,26 @@ type SymbolsMessage = {
 	maxSymbols: number;
 };
 
+type AlertsMessage = {
+	type: "alerts";
+	alerts: PriceAlert[];
+};
+
+type PriceAlertMessage = {
+	type: "price_alert";
+	symbol: string;
+	zone: "below" | "above";
+	price: number;
+	boundary: number | null;
+	timestamp: number;
+};
+
+type AlertResetMessage = {
+	type: "alert_reset";
+	symbol: string;
+	price: number;
+};
+
 type FinnhubErrorMessage = {
 	type: "finnhub_error";
 	message: string;
@@ -66,7 +98,15 @@ type ServerMessage =
 	| SnapshotMessage
 	| StatusMessage
 	| SymbolsMessage
+	| AlertsMessage
+	| PriceAlertMessage
+	| AlertResetMessage
 	| FinnhubErrorMessage;
+
+
+// ======================================================
+// HELPERS
+// ======================================================
 
 function createEmptyStock(
 	symbol: string,
@@ -81,6 +121,7 @@ function createEmptyStock(
 	};
 }
 
+
 function formatPrice(
 	price: number | null,
 ) {
@@ -90,6 +131,7 @@ function formatPrice(
 
 	return `$${price.toFixed(2)}`;
 }
+
 
 function formatTime(
 	timestamp: number | null,
@@ -110,6 +152,7 @@ function formatTime(
 	);
 }
 
+
 function normalizeSymbol(
 	value: string,
 ) {
@@ -118,6 +161,7 @@ function normalizeSymbol(
 		.toUpperCase();
 }
 
+
 function validSymbol(
 	value: string,
 ) {
@@ -125,6 +169,35 @@ function validSymbol(
 		value,
 	);
 }
+
+
+function parseAlertNumber(
+	value: string,
+): number | null {
+	const trimmed =
+		value.trim();
+
+	if (!trimmed) {
+		return null;
+	}
+
+	const parsed =
+		Number(trimmed);
+
+	if (
+		!Number.isFinite(parsed) ||
+		parsed <= 0
+	) {
+		return null;
+	}
+
+	return parsed;
+}
+
+
+// ======================================================
+// MINI CHART
+// ======================================================
 
 function MiniChart({
 	values,
@@ -171,23 +244,19 @@ function MiniChart({
 						padding +
 						(index /
 							Math.max(
-								values.length -
-									1,
+								values.length - 1,
 								1,
 							)) *
 							(width -
-								padding *
-									2);
+								padding * 2);
 
 					const y =
 						height -
 						padding -
-						((value -
-							min) /
+						((value - min) /
 							range) *
 							(height -
-								padding *
-									2);
+								padding * 2);
 
 					return `${x},${y}`;
 				},
@@ -211,13 +280,9 @@ function MiniChart({
 			>
 				<line
 					x1="0"
-					y1={
-						height / 2
-					}
+					y1={height / 2}
 					x2={width}
-					y2={
-						height / 2
-					}
+					y2={height / 2}
 					stroke="#1e293b"
 					strokeWidth="1"
 				/>
@@ -234,6 +299,11 @@ function MiniChart({
 		</div>
 	);
 }
+
+
+// ======================================================
+// APP
+// ======================================================
 
 function App() {
 	const [
@@ -302,9 +372,7 @@ function App() {
 			const symbol
 			of DEFAULT_SYMBOLS
 		) {
-			initial[
-				symbol
-			] =
+			initial[symbol] =
 				createEmptyStock(
 					symbol,
 				);
@@ -312,6 +380,57 @@ function App() {
 
 		return initial;
 	});
+
+
+	// ==================================================
+	// ALERT STATE
+	// ==================================================
+
+	const [
+		alerts,
+		setAlerts,
+	] = useState<
+		Record<
+			string,
+			PriceAlert
+		>
+	>({});
+
+	const [
+		belowInput,
+		setBelowInput,
+	] = useState("");
+
+	const [
+		aboveInput,
+		setAboveInput,
+	] = useState("");
+
+	const [
+		alertFormError,
+		setAlertFormError,
+	] = useState<
+		string | null
+	>(null);
+
+	const [
+		alertFormMessage,
+		setAlertFormMessage,
+	] = useState<
+		string | null
+	>(null);
+
+	const [
+		lastTriggeredAlert,
+		setLastTriggeredAlert,
+	] = useState<
+		PriceAlertMessage | null
+	>(null);
+
+
+	// ==================================================
+	// SYMBOLS
+	// ==================================================
 
 	function applyServerSymbols(
 		nextSymbols: string[],
@@ -355,10 +474,17 @@ function App() {
 		);
 	}
 
+
+	// ==================================================
+	// SNAPSHOT
+	// ==================================================
+
 	function applySnapshot(
 		trades: SnapshotTrade[],
 	) {
-		if (!trades.length) {
+		if (
+			!trades.length
+		) {
 			return;
 		}
 
@@ -374,8 +500,7 @@ function App() {
 				) {
 					const old =
 						updated[
-							trade
-								.symbol
+							trade.symbol
 						] ??
 						createEmptyStock(
 							trade.symbol,
@@ -401,8 +526,7 @@ function App() {
 
 						history:
 							old.history
-								.length >
-							0
+								.length > 0
 								? old.history
 								: [
 										trade.price,
@@ -414,6 +538,36 @@ function App() {
 			},
 		);
 	}
+
+
+	// ==================================================
+	// ALERT LIST FROM SERVER
+	// ==================================================
+
+	function applyAlerts(
+		serverAlerts: PriceAlert[],
+	) {
+		const next: Record<
+			string,
+			PriceAlert
+		> = {};
+
+		for (
+			const alert
+			of serverAlerts
+		) {
+			next[
+				alert.symbol
+			] = alert;
+		}
+
+		setAlerts(next);
+	}
+
+
+	// ==================================================
+	// WEBSOCKET
+	// ==================================================
 
 	const socket =
 		usePartySocket({
@@ -445,6 +599,11 @@ function App() {
 						JSON.parse(
 							event.data as string,
 						) as ServerMessage;
+
+
+					// ------------------------------
+					// STATUS
+					// ------------------------------
 
 					if (
 						message.type ===
@@ -481,6 +640,11 @@ function App() {
 						return;
 					}
 
+
+					// ------------------------------
+					// SYMBOLS
+					// ------------------------------
+
 					if (
 						message.type ===
 						"symbols"
@@ -496,6 +660,11 @@ function App() {
 						return;
 					}
 
+
+					// ------------------------------
+					// SNAPSHOT
+					// ------------------------------
+
 					if (
 						message.type ===
 						"snapshot"
@@ -507,6 +676,55 @@ function App() {
 						return;
 					}
 
+
+					// ------------------------------
+					// ALERT SETTINGS
+					// ------------------------------
+
+					if (
+						message.type ===
+						"alerts"
+					) {
+						applyAlerts(
+							message.alerts,
+						);
+
+						return;
+					}
+
+
+					// ------------------------------
+					// REAL PRICE ALERT
+					// ------------------------------
+
+					if (
+						message.type ===
+						"price_alert"
+					) {
+						setLastTriggeredAlert(
+							message,
+						);
+
+						return;
+					}
+
+
+					// ------------------------------
+					// ALERT RESET
+					// ------------------------------
+
+					if (
+						message.type ===
+						"alert_reset"
+					) {
+						return;
+					}
+
+
+					// ------------------------------
+					// FINNHUB ERROR
+					// ------------------------------
+
 					if (
 						message.type ===
 						"finnhub_error"
@@ -517,6 +735,11 @@ function App() {
 
 						return;
 					}
+
+
+					// ------------------------------
+					// LIVE TRADE
+					// ------------------------------
 
 					if (
 						message.type ===
@@ -532,8 +755,7 @@ function App() {
 							) => {
 								const old =
 									previous[
-										message
-											.symbol
+										message.symbol
 									] ??
 									createEmptyStock(
 										message.symbol,
@@ -550,7 +772,9 @@ function App() {
 								return {
 									...previous,
 
-									[message.symbol]:
+									[
+										message.symbol
+									]:
 										{
 											...old,
 
@@ -573,6 +797,7 @@ function App() {
 							},
 						);
 					}
+
 				} catch (
 					error
 				) {
@@ -584,10 +809,14 @@ function App() {
 			},
 		});
 
+
+	// ==================================================
+	// SELECTED SYMBOL
+	// ==================================================
+
 	useEffect(() => {
 		if (
-			symbols.length >
-				0 &&
+			symbols.length > 0 &&
 			!symbols.includes(
 				selectedSymbol,
 			)
@@ -601,6 +830,55 @@ function App() {
 		selectedSymbol,
 	]);
 
+
+	// ==================================================
+	// LOAD ALERT FORM WHEN SYMBOL CHANGES
+	// ==================================================
+
+	useEffect(() => {
+		const alert =
+			alerts[
+				selectedSymbol
+			];
+
+		if (alert) {
+			setBelowInput(
+				alert.below ===
+				null
+					? ""
+					: String(
+							alert.below,
+						),
+			);
+
+			setAboveInput(
+				alert.above ===
+				null
+					? ""
+					: String(
+							alert.above,
+						),
+			);
+
+		} else {
+			setBelowInput("");
+			setAboveInput("");
+		}
+
+		setAlertFormError(
+			null,
+		);
+
+		setAlertFormMessage(
+			null,
+		);
+
+	}, [
+		selectedSymbol,
+		alerts,
+	]);
+
+
 	const selected =
 		stocks[
 			selectedSymbol
@@ -608,6 +886,17 @@ function App() {
 		createEmptyStock(
 			selectedSymbol,
 		);
+
+
+	const selectedAlert =
+		alerts[
+			selectedSymbol
+		] ?? null;
+
+
+	// ==================================================
+	// PRICE CHANGE
+	// ==================================================
 
 	const change =
 		useMemo(() => {
@@ -639,10 +928,16 @@ function App() {
 			};
 		}, [selected]);
 
+
 	const positive =
 		change.value !==
 			null &&
 		change.value >= 0;
+
+
+	// ==================================================
+	// WATCHLIST COMMANDS
+	// ==================================================
 
 	function sendSymbols(
 		nextSymbols: string[],
@@ -657,6 +952,7 @@ function App() {
 			}),
 		);
 	}
+
 
 	function addSymbol() {
 		setWatchlistError(
@@ -742,6 +1038,7 @@ function App() {
 		);
 	}
 
+
 	function removeSymbol(
 		symbolToRemove: string,
 	) {
@@ -750,7 +1047,8 @@ function App() {
 		);
 
 		if (
-			symbols.length <= 1
+			symbols.length <=
+			1
 		) {
 			setWatchlistError(
 				"Ve watchlistu musí zůstat alespoň jeden ticker.",
@@ -784,6 +1082,137 @@ function App() {
 		);
 	}
 
+
+	// ==================================================
+	// SAVE ALERT
+	// ==================================================
+
+	function saveAlert() {
+		setAlertFormError(
+			null,
+		);
+
+		setAlertFormMessage(
+			null,
+		);
+
+		const below =
+			parseAlertNumber(
+				belowInput,
+			);
+
+		const above =
+			parseAlertNumber(
+				aboveInput,
+			);
+
+
+		if (
+			belowInput.trim() &&
+			below === null
+		) {
+			setAlertFormError(
+				"Below musí být kladné číslo.",
+			);
+
+			return;
+		}
+
+
+		if (
+			aboveInput.trim() &&
+			above === null
+		) {
+			setAlertFormError(
+				"Above musí být kladné číslo.",
+			);
+
+			return;
+		}
+
+
+		if (
+			below === null &&
+			above === null
+		) {
+			setAlertFormError(
+				"Zadej alespoň jednu hranici.",
+			);
+
+			return;
+		}
+
+
+		if (
+			below !== null &&
+			above !== null &&
+			below >= above
+		) {
+			setAlertFormError(
+				"Below musí být nižší než Above.",
+			);
+
+			return;
+		}
+
+
+		socket.send(
+			JSON.stringify({
+				type:
+					"set_alert",
+
+				symbol:
+					selectedSymbol,
+
+				below,
+
+				above,
+
+				enabled:
+					true,
+			}),
+		);
+
+
+		setAlertFormMessage(
+			`Alert pro ${selectedSymbol} uložen.`,
+		);
+	}
+
+
+	// ==================================================
+	// DELETE ALERT
+	// ==================================================
+
+	function deleteAlert() {
+		setAlertFormError(
+			null,
+		);
+
+		socket.send(
+			JSON.stringify({
+				type:
+					"delete_alert",
+
+				symbol:
+					selectedSymbol,
+			}),
+		);
+
+		setBelowInput("");
+
+		setAboveInput("");
+
+		setAlertFormMessage(
+			`Alert pro ${selectedSymbol} odstraněn.`,
+		);
+	}
+
+
+	// ==================================================
+	// STATUS
+	// ==================================================
+
 	const statusColor =
 		connectionStatus ===
 		"connected"
@@ -795,6 +1224,7 @@ function App() {
 					  "error"
 					? "#ef4444"
 					: "#f59e0b";
+
 
 	const statusText =
 		connectionStatus ===
@@ -808,32 +1238,49 @@ function App() {
 					? "ERROR"
 					: "DISCONNECTED";
 
+
+	// ==================================================
+	// RENDER
+	// ==================================================
+
 	return (
 		<div
 			style={{
 				minHeight:
 					"100vh",
+
 				background:
 					"#020617",
+
 				color:
 					"#e2e8f0",
+
 				fontFamily:
 					'Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
 			}}
 		>
+
+			{/* HEADER */}
+
 			<header
 				style={{
 					height: 64,
+
 					borderBottom:
 						"1px solid #1e293b",
+
 					display:
 						"flex",
+
 					alignItems:
 						"center",
+
 					justifyContent:
 						"space-between",
+
 					padding:
 						"0 28px",
+
 					background:
 						"#0f172a",
 				}}
@@ -843,25 +1290,24 @@ function App() {
 						style={{
 							fontSize:
 								20,
+
 							fontWeight:
 								800,
 						}}
 					>
-						Stocktrade
-						Live
+						Stocktrade Live
 					</div>
 
 					<div
 						style={{
 							fontSize:
 								12,
+
 							color:
 								"#64748b",
 						}}
 					>
-						Finnhub
-						realtime
-						market feed
+						Finnhub realtime market feed
 					</div>
 				</div>
 
@@ -869,35 +1315,137 @@ function App() {
 					style={{
 						fontSize:
 							13,
+
 						fontWeight:
 							700,
+
 						color:
 							statusColor,
 					}}
 				>
-					●{" "}
-					{statusText}
+					● {statusText}
 				</div>
 			</header>
+
+
+			{/* PRICE ALERT BANNER */}
+
+			{lastTriggeredAlert && (
+				<div
+					style={{
+						background:
+							lastTriggeredAlert.zone ===
+							"above"
+								? "#052e16"
+								: "#450a0a",
+
+						borderBottom:
+							lastTriggeredAlert.zone ===
+							"above"
+								? "1px solid #166534"
+								: "1px solid #991b1b",
+
+						padding:
+							"10px 28px",
+
+						display:
+							"flex",
+
+						alignItems:
+							"center",
+
+						justifyContent:
+							"space-between",
+
+						fontSize:
+							13,
+
+						fontWeight:
+							700,
+					}}
+				>
+					<div>
+						PRICE ALERT:{" "}
+
+						{lastTriggeredAlert.symbol}{" "}
+
+						{lastTriggeredAlert.zone ===
+						"above"
+							? "vzrostl"
+							: "klesl"}{" "}
+
+						na{" "}
+
+						{formatPrice(
+							lastTriggeredAlert.price,
+						)}
+
+						{" "}— hranice{" "}
+
+						{formatPrice(
+							lastTriggeredAlert.boundary,
+						)}
+					</div>
+
+					<button
+						onClick={() =>
+							setLastTriggeredAlert(
+								null,
+							)
+						}
+						style={{
+							border:
+								"none",
+
+							background:
+								"transparent",
+
+							color:
+								"#cbd5e1",
+
+							cursor:
+								"pointer",
+
+							fontSize:
+								18,
+						}}
+					>
+						×
+					</button>
+				</div>
+			)}
+
+
+			{/* MAIN GRID */}
 
 			<div
 				style={{
 					display:
 						"grid",
+
 					gridTemplateColumns:
-						"280px minmax(0, 1fr) 300px",
+						"280px minmax(0, 1fr) 320px",
+
 					minHeight:
-						"calc(100vh - 64px)",
+						lastTriggeredAlert
+							? "calc(100vh - 105px)"
+							: "calc(100vh - 64px)",
 				}}
 			>
+
+				{/* WATCHLIST */}
+
 				<aside
 					style={{
 						borderRight:
 							"1px solid #1e293b",
+
 						background:
 							"#0b1120",
+
 						padding:
 							18,
+
 						overflowY:
 							"auto",
 					}}
@@ -906,10 +1454,13 @@ function App() {
 						style={{
 							display:
 								"flex",
+
 							alignItems:
 								"center",
+
 							justifyContent:
 								"space-between",
+
 							marginBottom:
 								14,
 						}}
@@ -918,10 +1469,13 @@ function App() {
 							style={{
 								fontSize:
 									12,
+
 								fontWeight:
 									700,
+
 								color:
 									"#64748b",
+
 								letterSpacing:
 									1,
 							}}
@@ -933,27 +1487,29 @@ function App() {
 							style={{
 								fontSize:
 									11,
+
 								fontWeight:
 									700,
+
 								color:
 									"#94a3b8",
 							}}
 						>
-							{
-								symbols.length
-							}{" "}
-							/{" "}
-							{
-								maxSymbols
-							}
+							{symbols.length} / {maxSymbols}
 						</div>
 					</div>
+
+
+					{/* ADD SYMBOL */}
 
 					<div
 						style={{
 							display:
 								"flex",
-							gap: 6,
+
+							gap:
+								6,
+
 							marginBottom:
 								8,
 						}}
@@ -962,15 +1518,15 @@ function App() {
 							value={
 								newSymbol
 							}
+
 							onChange={(
 								event,
 							) =>
 								setNewSymbol(
-									event
-										.target
-										.value,
+									event.target.value,
 								)
 							}
+
 							onKeyDown={(
 								event,
 							) => {
@@ -983,28 +1539,41 @@ function App() {
 									addSymbol();
 								}
 							}}
+
 							placeholder="TSLA"
+
 							maxLength={
 								20
 							}
+
 							style={{
-								flex: 1,
+								flex:
+									1,
+
 								minWidth:
 									0,
+
 								background:
 									"#020617",
+
 								border:
 									"1px solid #334155",
+
 								color:
 									"#e2e8f0",
+
 								borderRadius:
 									7,
+
 								padding:
 									"9px 10px",
+
 								fontWeight:
 									700,
+
 								textTransform:
 									"uppercase",
+
 								outline:
 									"none",
 							}}
@@ -1014,28 +1583,37 @@ function App() {
 							onClick={
 								addSymbol
 							}
+
 							disabled={
 								symbols.length >=
 								maxSymbols
 							}
+
 							style={{
 								border:
 									"none",
+
 								borderRadius:
 									7,
+
 								background:
 									"#2563eb",
+
 								color:
 									"white",
+
 								fontWeight:
 									800,
+
 								padding:
 									"0 12px",
+
 								cursor:
 									symbols.length >=
 									maxSymbols
 										? "not-allowed"
 										: "pointer",
+
 								opacity:
 									symbols.length >=
 									maxSymbols
@@ -1047,24 +1625,26 @@ function App() {
 						</button>
 					</div>
 
+
 					{watchlistError && (
 						<div
 							style={{
 								fontSize:
 									11,
+
 								color:
 									"#f87171",
+
 								marginBottom:
 									10,
-								lineHeight:
-									1.4,
 							}}
 						>
-							{
-								watchlistError
-							}
+							{watchlistError}
 						</div>
 					)}
+
+
+					{/* SYMBOL ROWS */}
 
 					{symbols.map(
 						(
@@ -1082,14 +1662,23 @@ function App() {
 								symbol ===
 								selectedSymbol;
 
+							const hasAlert =
+								Boolean(
+									alerts[
+										symbol
+									],
+								);
+
 							return (
 								<div
 									key={
 										symbol
 									}
+
 									style={{
 										position:
 											"relative",
+
 										marginBottom:
 											6,
 									}}
@@ -1100,23 +1689,31 @@ function App() {
 												symbol,
 											)
 										}
+
 										style={{
 											width:
 												"100%",
+
 											border:
 												"none",
+
 											borderRadius:
 												8,
+
 											background:
 												selectedRow
 													? "#1e293b"
 													: "transparent",
+
 											color:
 												"#e2e8f0",
+
 											padding:
 												"12px 34px 12px 10px",
+
 											cursor:
 												"pointer",
+
 											textAlign:
 												"left",
 										}}
@@ -1125,17 +1722,53 @@ function App() {
 											style={{
 												display:
 													"flex",
+
 												justifyContent:
 													"space-between",
+
 												alignItems:
 													"center",
 											}}
 										>
-											<strong>
-												{
-													symbol
-												}
-											</strong>
+											<div
+												style={{
+													display:
+														"flex",
+
+													alignItems:
+														"center",
+
+													gap:
+														6,
+												}}
+											>
+												<strong>
+													{symbol}
+												</strong>
+
+												{hasAlert && (
+													<span
+														title="Aktivní cenový alert"
+
+														style={{
+															width:
+																7,
+
+															height:
+																7,
+
+															borderRadius:
+																"50%",
+
+															background:
+																"#f59e0b",
+
+															display:
+																"inline-block",
+														}}
+													/>
+												)}
+											</div>
 
 											<span
 												style={{
@@ -1156,8 +1789,10 @@ function App() {
 											style={{
 												fontSize:
 													11,
+
 												color:
 													"#64748b",
+
 												marginTop:
 													3,
 											}}
@@ -1174,32 +1809,42 @@ function App() {
 												symbol,
 											)
 										}
+
 										title={`Odebrat ${symbol}`}
+
 										style={{
 											position:
 												"absolute",
+
 											right:
 												7,
+
 											top:
 												8,
+
 											width:
 												23,
+
 											height:
 												23,
+
 											border:
 												"none",
+
 											borderRadius:
 												6,
+
 											background:
 												"transparent",
+
 											color:
 												"#64748b",
+
 											cursor:
 												"pointer",
+
 											fontSize:
 												16,
-											lineHeight:
-												1,
 										}}
 									>
 										×
@@ -1210,10 +1855,14 @@ function App() {
 					)}
 				</aside>
 
+
+				{/* MAIN MARKET */}
+
 				<main
 					style={{
 						padding:
 							"28px 32px",
+
 						minWidth:
 							0,
 					}}
@@ -1223,35 +1872,42 @@ function App() {
 							style={{
 								background:
 									"#450a0a",
+
 								border:
 									"1px solid #7f1d1d",
+
 								color:
 									"#fecaca",
+
 								borderRadius:
 									8,
+
 								padding:
 									"10px 14px",
+
 								marginBottom:
 									18,
+
 								fontSize:
 									13,
 							}}
 						>
-							Finnhub:{" "}
-							{
-								serverError
-							}
+							Finnhub: {serverError}
 						</div>
 					)}
+
 
 					<div
 						style={{
 							display:
 								"flex",
+
 							justifyContent:
 								"space-between",
+
 							alignItems:
 								"flex-start",
+
 							marginBottom:
 								28,
 						}}
@@ -1261,8 +1917,10 @@ function App() {
 								style={{
 									fontSize:
 										14,
+
 									color:
 										"#64748b",
+
 									marginBottom:
 										6,
 								}}
@@ -1274,13 +1932,12 @@ function App() {
 								style={{
 									fontSize:
 										32,
+
 									margin:
 										0,
 								}}
 							>
-								{
-									selectedSymbol
-								}
+								{selectedSymbol}
 							</h1>
 						</div>
 
@@ -1294,6 +1951,7 @@ function App() {
 								style={{
 									fontSize:
 										34,
+
 									fontWeight:
 										800,
 								}}
@@ -1307,10 +1965,13 @@ function App() {
 								style={{
 									fontSize:
 										14,
+
 									fontWeight:
 										700,
+
 									marginTop:
 										4,
+
 									color:
 										change.value ===
 										null
@@ -1332,16 +1993,21 @@ function App() {
 						</div>
 					</div>
 
+
 					<section
 						style={{
 							border:
 								"1px solid #1e293b",
+
 							borderRadius:
 								12,
+
 							background:
 								"#0f172a",
+
 							padding:
 								20,
+
 							color:
 								change.value ===
 								null
@@ -1358,85 +2024,50 @@ function App() {
 						/>
 					</section>
 
+
 					<div
 						style={{
 							display:
 								"grid",
+
 							gridTemplateColumns:
 								"repeat(3, 1fr)",
-							gap: 14,
+
+							gap:
+								14,
+
 							marginTop:
 								18,
 						}}
 					>
-						<div
-							style={
-								statBox
-							}
-						>
-							<div
-								style={
-									statLabel
-								}
-							>
-								LAST
-								PRICE
+						<div style={statBox}>
+							<div style={statLabel}>
+								LAST PRICE
 							</div>
 
-							<div
-								style={
-									statValue
-								}
-							>
+							<div style={statValue}>
 								{formatPrice(
 									selected.price,
 								)}
 							</div>
 						</div>
 
-						<div
-							style={
-								statBox
-							}
-						>
-							<div
-								style={
-									statLabel
-								}
-							>
-								LAST
-								VOLUME
+						<div style={statBox}>
+							<div style={statLabel}>
+								LAST VOLUME
 							</div>
 
-							<div
-								style={
-									statValue
-								}
-							>
-								{selected.volume ??
-									"—"}
+							<div style={statValue}>
+								{selected.volume ?? "—"}
 							</div>
 						</div>
 
-						<div
-							style={
-								statBox
-							}
-						>
-							<div
-								style={
-									statLabel
-								}
-							>
-								LAST
-								TICK
+						<div style={statBox}>
+							<div style={statLabel}>
+								LAST TICK
 							</div>
 
-							<div
-								style={
-									statValue
-								}
-							>
+							<div style={statValue}>
 								{formatTime(
 									selected.timestamp,
 								)}
@@ -1445,12 +2076,17 @@ function App() {
 					</div>
 				</main>
 
+
+				{/* PRICE ALERT PANEL */}
+
 				<aside
 					style={{
 						borderLeft:
 							"1px solid #1e293b",
+
 						background:
 							"#0b1120",
+
 						padding:
 							20,
 					}}
@@ -1459,44 +2095,53 @@ function App() {
 						style={{
 							fontSize:
 								12,
+
 							fontWeight:
 								700,
+
 							color:
 								"#64748b",
+
 							letterSpacing:
 								1,
+
 							marginBottom:
 								18,
 						}}
 					>
-						TRADE PANEL
+						PRICE ALERTS
 					</div>
+
 
 					<div
 						style={{
 							fontSize:
 								24,
+
 							fontWeight:
 								800,
+
 							marginBottom:
-								6,
+								4,
 						}}
 					>
-						{
-							selectedSymbol
-						}
+						{selectedSymbol}
 					</div>
+
 
 					<div
 						style={{
 							fontSize:
 								18,
+
 							fontWeight:
 								700,
+
 							color:
 								"#94a3b8",
+
 							marginBottom:
-								20,
+								22,
 						}}
 					>
 						{formatPrice(
@@ -1504,53 +2149,323 @@ function App() {
 						)}
 					</div>
 
-					<button
-						disabled
-						style={{
-							...tradeButton,
-							background:
-								"#166534",
-						}}
+
+					{/* BELOW */}
+
+					<label
+						style={
+							alertLabel
+						}
 					>
-						BUY
-					</button>
+						Alert below
+					</label>
+
+					<input
+						type="number"
+
+						step="0.01"
+
+						min="0"
+
+						value={
+							belowInput
+						}
+
+						onChange={(
+							event,
+						) =>
+							setBelowInput(
+								event.target.value,
+							)
+						}
+
+						placeholder="např. 295"
+
+						style={
+							alertInput
+						}
+					/>
+
+
+					{/* ABOVE */}
+
+					<label
+						style={
+							alertLabel
+						}
+					>
+						Alert above
+					</label>
+
+					<input
+						type="number"
+
+						step="0.01"
+
+						min="0"
+
+						value={
+							aboveInput
+						}
+
+						onChange={(
+							event,
+						) =>
+							setAboveInput(
+								event.target.value,
+							)
+						}
+
+						placeholder="např. 320"
+
+						style={
+							alertInput
+						}
+					/>
+
+
+					{/* ERRORS */}
+
+					{alertFormError && (
+						<div
+							style={{
+								fontSize:
+									12,
+
+								color:
+									"#f87171",
+
+								marginBottom:
+									12,
+							}}
+						>
+							{alertFormError}
+						</div>
+					)}
+
+
+					{alertFormMessage && (
+						<div
+							style={{
+								fontSize:
+									12,
+
+								color:
+									"#4ade80",
+
+								marginBottom:
+									12,
+							}}
+						>
+							{alertFormMessage}
+						</div>
+					)}
+
+
+					{/* SAVE */}
 
 					<button
-						disabled
+						onClick={
+							saveAlert
+						}
+
 						style={{
-							...tradeButton,
+							width:
+								"100%",
+
+							border:
+								"none",
+
+							color:
+								"white",
+
 							background:
-								"#991b1b",
+								"#2563eb",
+
+							fontWeight:
+								800,
+
+							fontSize:
+								14,
+
+							padding:
+								"12px 16px",
+
+							borderRadius:
+								8,
+
+							cursor:
+								"pointer",
+
+							marginBottom:
+								10,
 						}}
 					>
-						SELL
+						SAVE ALERT
 					</button>
+
+
+					{/* DELETE */}
+
+					<button
+						onClick={
+							deleteAlert
+						}
+
+						disabled={
+							!selectedAlert
+						}
+
+						style={{
+							width:
+								"100%",
+
+							border:
+								"1px solid #7f1d1d",
+
+							color:
+								selectedAlert
+									? "#fca5a5"
+									: "#475569",
+
+							background:
+								"transparent",
+
+							fontWeight:
+								700,
+
+							fontSize:
+								13,
+
+							padding:
+								"11px 16px",
+
+							borderRadius:
+								8,
+
+							cursor:
+								selectedAlert
+									? "pointer"
+									: "not-allowed",
+
+							opacity:
+								selectedAlert
+									? 1
+									: 0.55,
+						}}
+					>
+						DELETE ALERT
+					</button>
+
+
+					{/* ACTIVE ALERT SUMMARY */}
+
+					{selectedAlert && (
+						<div
+							style={{
+								marginTop:
+									22,
+
+								border:
+									"1px solid #334155",
+
+								borderRadius:
+									8,
+
+								padding:
+									14,
+
+								background:
+									"#0f172a",
+							}}
+						>
+							<div
+								style={{
+									fontSize:
+										11,
+
+									color:
+										"#64748b",
+
+									fontWeight:
+										700,
+
+									letterSpacing:
+										0.8,
+
+									marginBottom:
+										10,
+								}}
+							>
+								ACTIVE ALERT
+							</div>
+
+							<div
+								style={{
+									fontSize:
+										13,
+
+									lineHeight:
+										1.8,
+								}}
+							>
+								<div>
+									Below:{" "}
+									<strong>
+										{formatPrice(
+											selectedAlert.below,
+										)}
+									</strong>
+								</div>
+
+								<div>
+									Above:{" "}
+									<strong>
+										{formatPrice(
+											selectedAlert.above,
+										)}
+									</strong>
+								</div>
+							</div>
+						</div>
+					)}
+
 
 					<p
 						style={{
 							fontSize:
 								12,
+
 							color:
 								"#64748b",
+
 							lineHeight:
 								1.6,
+
 							marginTop:
 								18,
 						}}
 					>
-						Obchodování je zatím
-						vypnuté. Tento panel
-						nyní slouží pouze jako
-						náhled budoucí funkce.
+						Alert se aktivuje pouze při
+						přechodu ceny přes nastavenou
+						hranici. Opakované tickové ceny
+						ve stejné zóně nevytvářejí další
+						upozornění.
 					</p>
 				</aside>
+
 			</div>
 		</div>
 	);
 }
 
-const statBox: React.CSSProperties =
-	{
+
+// ======================================================
+// STYLES
+// ======================================================
+
+const statBox:
+	React.CSSProperties = {
 		border:
 			"1px solid #1e293b",
 
@@ -1564,8 +2479,9 @@ const statBox: React.CSSProperties =
 			16,
 	};
 
-const statLabel: React.CSSProperties =
-	{
+
+const statLabel:
+	React.CSSProperties = {
 		fontSize:
 			11,
 
@@ -1582,8 +2498,9 @@ const statLabel: React.CSSProperties =
 			8,
 	};
 
-const statValue: React.CSSProperties =
-	{
+
+const statValue:
+	React.CSSProperties = {
 		fontSize:
 			18,
 
@@ -1591,38 +2508,66 @@ const statValue: React.CSSProperties =
 			800,
 	};
 
-const tradeButton: React.CSSProperties =
-	{
+
+const alertLabel:
+	React.CSSProperties = {
+		display:
+			"block",
+
+		fontSize:
+			11,
+
+		color:
+			"#94a3b8",
+
+		fontWeight:
+			700,
+
+		marginBottom:
+			6,
+
+		textTransform:
+			"uppercase",
+	};
+
+
+const alertInput:
+	React.CSSProperties = {
 		width:
 			"100%",
 
+		boxSizing:
+			"border-box",
+
+		background:
+			"#020617",
+
 		border:
-			"none",
+			"1px solid #334155",
 
 		color:
-			"white",
-
-		fontWeight:
-			800,
-
-		fontSize:
-			15,
-
-		padding:
-			"14px 18px",
+			"#e2e8f0",
 
 		borderRadius:
-			8,
+			7,
+
+		padding:
+			"10px 11px",
+
+		fontWeight:
+			700,
+
+		outline:
+			"none",
 
 		marginBottom:
-			12,
-
-		opacity:
-			0.65,
-
-		cursor:
-			"not-allowed",
+			16,
 	};
+
+
+// ======================================================
+// ROOT
+// ======================================================
 
 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
 createRoot(
