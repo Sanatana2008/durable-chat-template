@@ -7,7 +7,11 @@ import {
 
 const DEFAULT_SYMBOLS = ["AAPL", "NVDA", "MSFT"];
 const MAX_SYMBOLS = 40;
-const STORAGE_KEY = "watchlist_symbols";
+
+const WATCHLIST_STORAGE_KEY = "watchlist_symbols";
+const PRICES_STORAGE_KEY = "latest_prices";
+
+const PRICE_SAVE_INTERVAL_MS = 60_000;
 
 type FinnhubTrade = {
 	s: string;
@@ -23,6 +27,13 @@ type FinnhubMessage = {
 	msg?: string;
 };
 
+type LatestTrade = {
+	symbol: string;
+	price: number;
+	volume: number;
+	timestamp: number;
+};
+
 type ClientMessage =
 	| {
 			type: "set_symbols";
@@ -30,33 +41,54 @@ type ClientMessage =
 	  }
 	| {
 			type: "get_symbols";
+	  }
+	| {
+			type: "get_snapshot";
 	  };
 
 export class Chat extends Server<Env> {
 	static options = { hibernate: true };
 
 	private finnhubSocket: WebSocket | null = null;
-	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-	private symbols = new Set<string>(DEFAULT_SYMBOLS);
+	private reconnectTimer:
+		| ReturnType<typeof setTimeout>
+		| null = null;
+
+	private priceSaveTimer:
+		| ReturnType<typeof setTimeout>
+		| null = null;
+
+	private symbols =
+		new Set<string>(DEFAULT_SYMBOLS);
+
+	private latestTrades =
+		new Map<string, LatestTrade>();
+
 	private initialized = false;
+	private pricesDirty = false;
 
 	async onStart() {
-		await this.loadWatchlist();
+		await this.loadState();
 		this.connectFinnhub();
 	}
 
-	private async loadWatchlist() {
+	private async loadState() {
 		if (this.initialized) {
 			return;
 		}
 
 		this.initialized = true;
 
+		await this.loadWatchlist();
+		await this.loadLatestPrices();
+	}
+
+	private async loadWatchlist() {
 		try {
 			const saved =
 				await this.ctx.storage.get<string[]>(
-					STORAGE_KEY,
+					WATCHLIST_STORAGE_KEY,
 				);
 
 			if (
@@ -67,12 +99,11 @@ export class Chat extends Server<Env> {
 					this.normalizeSymbols(saved);
 
 				if (normalized.length > 0) {
-					this.symbols = new Set(
-						normalized,
-					);
+					this.symbols =
+						new Set(normalized);
 
 					console.log(
-						`Watchlist restored from storage (${this.symbols.size}/${MAX_SYMBOLS}): ${Array.from(
+						`Watchlist restored (${this.symbols.size}/${MAX_SYMBOLS}): ${Array.from(
 							this.symbols,
 						).join(", ")}`,
 					);
@@ -99,7 +130,7 @@ export class Chat extends Server<Env> {
 	private async saveWatchlist() {
 		try {
 			await this.ctx.storage.put(
-				STORAGE_KEY,
+				WATCHLIST_STORAGE_KEY,
 				Array.from(this.symbols),
 			);
 		} catch (error) {
@@ -110,7 +141,105 @@ export class Chat extends Server<Env> {
 		}
 	}
 
-	private normalizeSymbols(input: string[]) {
+	private async loadLatestPrices() {
+		try {
+			const saved =
+				await this.ctx.storage.get<
+					Record<string, LatestTrade>
+				>(PRICES_STORAGE_KEY);
+
+			if (!saved) {
+				return;
+			}
+
+			for (const [
+				symbol,
+				trade,
+			] of Object.entries(saved)) {
+				if (
+					typeof trade?.price !==
+						"number" ||
+					typeof trade?.timestamp !==
+						"number"
+				) {
+					continue;
+				}
+
+				this.latestTrades.set(
+					symbol,
+					trade,
+				);
+			}
+
+			console.log(
+				`Latest prices restored: ${this.latestTrades.size}`,
+			);
+		} catch (error) {
+			console.error(
+				"Latest prices load error:",
+				error,
+			);
+		}
+	}
+
+	private schedulePriceSave() {
+		this.pricesDirty = true;
+
+		if (this.priceSaveTimer) {
+			return;
+		}
+
+		this.priceSaveTimer =
+			setTimeout(async () => {
+				this.priceSaveTimer = null;
+
+				await this.saveLatestPrices();
+			}, PRICE_SAVE_INTERVAL_MS);
+	}
+
+	private async saveLatestPrices() {
+		if (!this.pricesDirty) {
+			return;
+		}
+
+		this.pricesDirty = false;
+
+		try {
+			const data: Record<
+				string,
+				LatestTrade
+			> = {};
+
+			for (const [
+				symbol,
+				trade,
+			] of this.latestTrades) {
+				data[symbol] = trade;
+			}
+
+			await this.ctx.storage.put(
+				PRICES_STORAGE_KEY,
+				data,
+			);
+
+			console.log(
+				`Latest prices stored: ${Object.keys(data).length}`,
+			);
+		} catch (error) {
+			this.pricesDirty = true;
+
+			console.error(
+				"Latest prices save error:",
+				error,
+			);
+
+			this.schedulePriceSave();
+		}
+	}
+
+	private normalizeSymbols(
+		input: string[],
+	) {
 		const result: string[] = [];
 
 		for (const raw of input) {
@@ -130,12 +259,15 @@ export class Chat extends Server<Env> {
 				continue;
 			}
 
-			if (!result.includes(symbol)) {
+			if (
+				!result.includes(symbol)
+			) {
 				result.push(symbol);
 			}
 
 			if (
-				result.length >= MAX_SYMBOLS
+				result.length >=
+				MAX_SYMBOLS
 			) {
 				break;
 			}
@@ -145,14 +277,17 @@ export class Chat extends Server<Env> {
 	}
 
 	private sendFinnhubCommand(
-		type: "subscribe" | "unsubscribe",
+		type:
+			| "subscribe"
+			| "unsubscribe",
 		symbol: string,
 	) {
 		const ws = this.finnhubSocket;
 
 		if (
 			!ws ||
-			ws.readyState !== WebSocket.OPEN
+			ws.readyState !==
+				WebSocket.OPEN
 		) {
 			return;
 		}
@@ -190,16 +325,60 @@ export class Chat extends Server<Env> {
 		);
 	}
 
+	private createSnapshot() {
+		const trades: LatestTrade[] =
+			[];
+
+		for (const symbol of this.symbols) {
+			const trade =
+				this.latestTrades.get(
+					symbol,
+				);
+
+			if (trade) {
+				trades.push(trade);
+			}
+		}
+
+		return {
+			type: "snapshot",
+			trades,
+		};
+	}
+
+	private sendSnapshot(
+		connection: Connection,
+	) {
+		connection.send(
+			JSON.stringify(
+				this.createSnapshot(),
+			),
+		);
+	}
+
+	private broadcastSnapshot() {
+		this.broadcast(
+			JSON.stringify(
+				this.createSnapshot(),
+			),
+		);
+	}
+
 	private async setSymbols(
 		nextSymbols: string[],
 	) {
 		const normalized =
-			this.normalizeSymbols(nextSymbols);
+			this.normalizeSymbols(
+				nextSymbols,
+			);
 
-		if (normalized.length === 0) {
+		if (
+			normalized.length === 0
+		) {
 			console.log(
 				"set_symbols ignored: empty symbol list",
 			);
+
 			return;
 		}
 
@@ -210,7 +389,9 @@ export class Chat extends Server<Env> {
 			new Set(normalized);
 
 		for (const symbol of oldSymbols) {
-			if (!newSymbols.has(symbol)) {
+			if (
+				!newSymbols.has(symbol)
+			) {
 				this.sendFinnhubCommand(
 					"unsubscribe",
 					symbol,
@@ -219,7 +400,9 @@ export class Chat extends Server<Env> {
 		}
 
 		for (const symbol of newSymbols) {
-			if (!oldSymbols.has(symbol)) {
+			if (
+				!oldSymbols.has(symbol)
+			) {
 				this.sendFinnhubCommand(
 					"subscribe",
 					symbol,
@@ -238,14 +421,17 @@ export class Chat extends Server<Env> {
 		);
 
 		this.broadcastSymbols();
+		this.broadcastSnapshot();
 	}
 
 	private connectFinnhub() {
 		if (
 			this.finnhubSocket &&
-			(this.finnhubSocket.readyState ===
+			(this.finnhubSocket
+				.readyState ===
 				WebSocket.OPEN ||
-				this.finnhubSocket.readyState ===
+				this.finnhubSocket
+					.readyState ===
 					WebSocket.CONNECTING)
 		) {
 			return;
@@ -275,34 +461,42 @@ export class Chat extends Server<Env> {
 			"Connecting to Finnhub...",
 		);
 
-		const ws = new WebSocket(
-			`wss://ws.finnhub.io?token=${encodeURIComponent(
-				apiKey,
-			)}`,
-		);
+		const ws =
+			new WebSocket(
+				`wss://ws.finnhub.io?token=${encodeURIComponent(
+					apiKey,
+				)}`,
+			);
 
 		this.finnhubSocket = ws;
 
-		ws.addEventListener("open", () => {
-			console.log(
-				"Finnhub WebSocket connected",
-			);
+		ws.addEventListener(
+			"open",
+			() => {
+				console.log(
+					"Finnhub WebSocket connected",
+				);
 
-			this.subscribeAll();
+				this.subscribeAll();
 
-			this.broadcast(
-				JSON.stringify({
-					type: "status",
-					status: "connected",
-					symbols: Array.from(
-						this.symbols,
-					),
-					maxSymbols: MAX_SYMBOLS,
-				}),
-			);
+				this.broadcast(
+					JSON.stringify({
+						type: "status",
+						status:
+							"connected",
+						symbols:
+							Array.from(
+								this.symbols,
+							),
+						maxSymbols:
+							MAX_SYMBOLS,
+					}),
+				);
 
-			this.broadcastSymbols();
-		});
+				this.broadcastSymbols();
+				this.broadcastSnapshot();
+			},
+		);
 
 		ws.addEventListener(
 			"message",
@@ -327,16 +521,28 @@ export class Chat extends Server<Env> {
 								continue;
 							}
 
+							const latest: LatestTrade =
+								{
+									symbol:
+										trade.s,
+									price:
+										trade.p,
+									volume:
+										trade.v,
+									timestamp:
+										trade.t,
+								};
+
+							this.latestTrades.set(
+								trade.s,
+								latest,
+							);
+
+							this.schedulePriceSave();
+
 							const payload = {
 								type: "trade",
-								symbol:
-									trade.s,
-								price:
-									trade.p,
-								volume:
-									trade.v,
-								timestamp:
-									trade.t,
+								...latest,
 								conditions:
 									trade.c ??
 									[],
@@ -368,7 +574,8 @@ export class Chat extends Server<Env> {
 
 						this.broadcast(
 							JSON.stringify({
-								type: "finnhub_error",
+								type:
+									"finnhub_error",
 								message:
 									message.msg ??
 									"Unknown Finnhub error",
@@ -398,7 +605,8 @@ export class Chat extends Server<Env> {
 					`Finnhub WebSocket closed: ${event.code} ${event.reason}`,
 				);
 
-				this.finnhubSocket = null;
+				this.finnhubSocket =
+					null;
 
 				this.broadcast(
 					JSON.stringify({
@@ -450,7 +658,7 @@ export class Chat extends Server<Env> {
 	async onConnect(
 		connection: Connection,
 	) {
-		await this.loadWatchlist();
+		await this.loadState();
 
 		connection.send(
 			JSON.stringify({
@@ -464,7 +672,8 @@ export class Chat extends Server<Env> {
 				symbols: Array.from(
 					this.symbols,
 				),
-				maxSymbols: MAX_SYMBOLS,
+				maxSymbols:
+					MAX_SYMBOLS,
 			}),
 		);
 
@@ -474,9 +683,12 @@ export class Chat extends Server<Env> {
 				symbols: Array.from(
 					this.symbols,
 				),
-				maxSymbols: MAX_SYMBOLS,
+				maxSymbols:
+					MAX_SYMBOLS,
 			}),
 		);
+
+		this.sendSnapshot(connection);
 
 		this.connectFinnhub();
 	}
@@ -513,7 +725,7 @@ export class Chat extends Server<Env> {
 				message.type ===
 				"get_symbols"
 			) {
-				await this.loadWatchlist();
+				await this.loadState();
 
 				connection.send(
 					JSON.stringify({
@@ -525,6 +737,19 @@ export class Chat extends Server<Env> {
 						maxSymbols:
 							MAX_SYMBOLS,
 					}),
+				);
+
+				return;
+			}
+
+			if (
+				message.type ===
+				"get_snapshot"
+			) {
+				await this.loadState();
+
+				this.sendSnapshot(
+					connection,
 				);
 			}
 		} catch (error) {
