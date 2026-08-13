@@ -26,6 +26,18 @@ type TradeMessage = {
 	timestamp: number;
 };
 
+type SnapshotTrade = {
+	symbol: string;
+	price: number;
+	volume: number;
+	timestamp: number;
+};
+
+type SnapshotMessage = {
+	type: "snapshot";
+	trades: SnapshotTrade[];
+};
+
 type StatusMessage = {
 	type: "status";
 	status:
@@ -51,11 +63,14 @@ type FinnhubErrorMessage = {
 
 type ServerMessage =
 	| TradeMessage
+	| SnapshotMessage
 	| StatusMessage
 	| SymbolsMessage
 	| FinnhubErrorMessage;
 
-function createEmptyStock(symbol: string): StockData {
+function createEmptyStock(
+	symbol: string,
+): StockData {
 	return {
 		symbol,
 		price: null,
@@ -66,15 +81,26 @@ function createEmptyStock(symbol: string): StockData {
 	};
 }
 
-function formatPrice(price: number | null) {
-	if (price === null) return "—";
+function formatPrice(
+	price: number | null,
+) {
+	if (price === null) {
+		return "—";
+	}
+
 	return `$${price.toFixed(2)}`;
 }
 
-function formatTime(timestamp: number | null) {
-	if (!timestamp) return "—";
+function formatTime(
+	timestamp: number | null,
+) {
+	if (!timestamp) {
+		return "—";
+	}
 
-	return new Date(timestamp).toLocaleTimeString(
+	return new Date(
+		timestamp,
+	).toLocaleTimeString(
 		"cs-CZ",
 		{
 			hour: "2-digit",
@@ -84,12 +110,20 @@ function formatTime(timestamp: number | null) {
 	);
 }
 
-function normalizeSymbol(value: string) {
-	return value.trim().toUpperCase();
+function normalizeSymbol(
+	value: string,
+) {
+	return value
+		.trim()
+		.toUpperCase();
 }
 
-function validSymbol(value: string) {
-	return /^[A-Z0-9.\-:]{1,20}$/.test(value);
+function validSymbol(
+	value: string,
+) {
+	return /^[A-Z0-9.\-:]{1,20}$/.test(
+		value,
+	);
 }
 
 function MiniChart({
@@ -117,27 +151,48 @@ function MiniChart({
 	const height = 260;
 	const padding = 12;
 
-	const min = Math.min(...values);
-	const max = Math.max(...values);
-	const range = max - min || 1;
+	const min =
+		Math.min(...values);
 
-	const points = values
-		.map((value, index) => {
-			const x =
-				padding +
-				(index /
-					Math.max(values.length - 1, 1)) *
-					(width - padding * 2);
+	const max =
+		Math.max(...values);
 
-			const y =
-				height -
-				padding -
-				((value - min) / range) *
-					(height - padding * 2);
+	const range =
+		max - min || 1;
 
-			return `${x},${y}`;
-		})
-		.join(" ");
+	const points =
+		values
+			.map(
+				(
+					value,
+					index,
+				) => {
+					const x =
+						padding +
+						(index /
+							Math.max(
+								values.length -
+									1,
+								1,
+							)) *
+							(width -
+								padding *
+									2);
+
+					const y =
+						height -
+						padding -
+						((value -
+							min) /
+							range) *
+							(height -
+								padding *
+									2);
+
+					return `${x},${y}`;
+				},
+			)
+			.join(" ");
 
 	return (
 		<div
@@ -156,9 +211,13 @@ function MiniChart({
 			>
 				<line
 					x1="0"
-					y1={height / 2}
+					y1={
+						height / 2
+					}
 					x2={width}
-					y2={height / 2}
+					y2={
+						height / 2
+					}
 					stroke="#1e293b"
 					strokeWidth="1"
 				/>
@@ -177,19 +236,36 @@ function MiniChart({
 }
 
 function App() {
-	const [symbols, setSymbols] =
-		useState<string[]>(DEFAULT_SYMBOLS);
+	const [
+		symbols,
+		setSymbols,
+	] = useState<string[]>(
+		DEFAULT_SYMBOLS,
+	);
 
-	const [maxSymbols, setMaxSymbols] =
-		useState(DEFAULT_MAX_SYMBOLS);
+	const [
+		maxSymbols,
+		setMaxSymbols,
+	] = useState(
+		DEFAULT_MAX_SYMBOLS,
+	);
 
-	const [selectedSymbol, setSelectedSymbol] =
-		useState("AAPL");
+	const [
+		selectedSymbol,
+		setSelectedSymbol,
+	] = useState("AAPL");
 
-	const [newSymbol, setNewSymbol] = useState("");
+	const [
+		newSymbol,
+		setNewSymbol,
+	] = useState("");
 
-	const [watchlistError, setWatchlistError] =
-		useState<string | null>(null);
+	const [
+		watchlistError,
+		setWatchlistError,
+	] = useState<
+		string | null
+	>(null);
 
 	const [
 		connectionStatus,
@@ -201,211 +277,371 @@ function App() {
 		| "error"
 	>("connecting");
 
-	const [serverError, setServerError] =
-		useState<string | null>(null);
+	const [
+		serverError,
+		setServerError,
+	] = useState<
+		string | null
+	>(null);
 
-	const [stocks, setStocks] = useState<
-		Record<string, StockData>
+	const [
+		stocks,
+		setStocks,
+	] = useState<
+		Record<
+			string,
+			StockData
+		>
 	>(() => {
-			const initial: Record<
-				string,
-				StockData
-			> = {};
+		const initial: Record<
+			string,
+			StockData
+		> = {};
 
-			for (const symbol of DEFAULT_SYMBOLS) {
-				initial[symbol] =
-					createEmptyStock(symbol);
-			}
-
-			return initial;
-		});
-
-	const socket = usePartySocket({
-		party: "chat",
-		room: "stocks",
-
-		onOpen: () => {
-			setConnectionStatus("connecting");
-			setServerError(null);
-
-			socket.send(
-				JSON.stringify({
-					type: "get_symbols",
-				}),
-			);
-		},
-
-		onClose: () => {
-			setConnectionStatus("disconnected");
-		},
-
-		onMessage: (event) => {
-			try {
-				const message = JSON.parse(
-					event.data as string,
-				) as ServerMessage;
-
-				if (message.type === "status") {
-					setConnectionStatus(
-						message.status,
-					);
-
-					if (message.maxSymbols) {
-						setMaxSymbols(
-							message.maxSymbols,
-						);
-					}
-
-					if (message.symbols) {
-						applyServerSymbols(
-							message.symbols,
-						);
-					}
-
-					if (message.message) {
-						setServerError(
-							message.message,
-						);
-					}
-
-					return;
-				}
-
-				if (message.type === "symbols") {
-					setMaxSymbols(
-						message.maxSymbols,
-					);
-
-					applyServerSymbols(
-						message.symbols,
-					);
-
-					return;
-				}
-
-				if (
-					message.type ===
-					"finnhub_error"
-				) {
-					setServerError(
-						message.message,
-					);
-					return;
-				}
-
-				if (message.type === "trade") {
-					setConnectionStatus(
-						"connected",
-					);
-
-					setStocks((previous) => {
-						const old =
-							previous[
-								message.symbol
-							] ??
-							createEmptyStock(
-								message.symbol,
-							);
-
-						const history = [
-							...old.history,
-							message.price,
-						].slice(-120);
-
-						return {
-							...previous,
-
-							[message.symbol]: {
-								...old,
-								price:
-									message.price,
-								volume:
-									message.volume,
-								timestamp:
-									message.timestamp,
-								firstPrice:
-									old.firstPrice ??
-									message.price,
-								history,
-							},
-						};
-					});
-				}
-			} catch (error) {
-				console.error(
-					"WebSocket message error:",
-					error,
+		for (
+			const symbol
+			of DEFAULT_SYMBOLS
+		) {
+			initial[
+				symbol
+			] =
+				createEmptyStock(
+					symbol,
 				);
-			}
-		},
+		}
+
+		return initial;
 	});
 
 	function applyServerSymbols(
 		nextSymbols: string[],
 	) {
-		if (!nextSymbols.length) {
+		if (
+			!nextSymbols.length
+		) {
 			return;
 		}
 
-		setSymbols(nextSymbols);
+		setSymbols(
+			nextSymbols,
+		);
 
-		setStocks((previous) => {
-			const updated = {
-				...previous,
-			};
+		setStocks(
+			(previous) => {
+				const updated = {
+					...previous,
+				};
 
-			for (const symbol of nextSymbols) {
-				if (!updated[symbol]) {
-					updated[symbol] =
-						createEmptyStock(symbol);
+				for (
+					const symbol
+					of nextSymbols
+				) {
+					if (
+						!updated[
+							symbol
+						]
+					) {
+						updated[
+							symbol
+						] =
+							createEmptyStock(
+								symbol,
+							);
+					}
 				}
-			}
 
-			return updated;
-		});
+				return updated;
+			},
+		);
 	}
+
+	function applySnapshot(
+		trades: SnapshotTrade[],
+	) {
+		if (!trades.length) {
+			return;
+		}
+
+		setStocks(
+			(previous) => {
+				const updated = {
+					...previous,
+				};
+
+				for (
+					const trade
+					of trades
+				) {
+					const old =
+						updated[
+							trade
+								.symbol
+						] ??
+						createEmptyStock(
+							trade.symbol,
+						);
+
+					updated[
+						trade.symbol
+					] = {
+						...old,
+
+						price:
+							trade.price,
+
+						volume:
+							trade.volume,
+
+						timestamp:
+							trade.timestamp,
+
+						firstPrice:
+							old.firstPrice ??
+							trade.price,
+
+						history:
+							old.history
+								.length >
+							0
+								? old.history
+								: [
+										trade.price,
+									],
+					};
+				}
+
+				return updated;
+			},
+		);
+	}
+
+	const socket =
+		usePartySocket({
+			party: "chat",
+
+			room: "stocks",
+
+			onOpen: () => {
+				setConnectionStatus(
+					"connecting",
+				);
+
+				setServerError(
+					null,
+				);
+			},
+
+			onClose: () => {
+				setConnectionStatus(
+					"disconnected",
+				);
+			},
+
+			onMessage: (
+				event,
+			) => {
+				try {
+					const message =
+						JSON.parse(
+							event.data as string,
+						) as ServerMessage;
+
+					if (
+						message.type ===
+						"status"
+					) {
+						setConnectionStatus(
+							message.status,
+						);
+
+						if (
+							message.maxSymbols
+						) {
+							setMaxSymbols(
+								message.maxSymbols,
+							);
+						}
+
+						if (
+							message.symbols
+						) {
+							applyServerSymbols(
+								message.symbols,
+							);
+						}
+
+						if (
+							message.message
+						) {
+							setServerError(
+								message.message,
+							);
+						}
+
+						return;
+					}
+
+					if (
+						message.type ===
+						"symbols"
+					) {
+						setMaxSymbols(
+							message.maxSymbols,
+						);
+
+						applyServerSymbols(
+							message.symbols,
+						);
+
+						return;
+					}
+
+					if (
+						message.type ===
+						"snapshot"
+					) {
+						applySnapshot(
+							message.trades,
+						);
+
+						return;
+					}
+
+					if (
+						message.type ===
+						"finnhub_error"
+					) {
+						setServerError(
+							message.message,
+						);
+
+						return;
+					}
+
+					if (
+						message.type ===
+						"trade"
+					) {
+						setConnectionStatus(
+							"connected",
+						);
+
+						setStocks(
+							(
+								previous,
+							) => {
+								const old =
+									previous[
+										message
+											.symbol
+									] ??
+									createEmptyStock(
+										message.symbol,
+									);
+
+								const history =
+									[
+										...old.history,
+										message.price,
+									].slice(
+										-120,
+									);
+
+								return {
+									...previous,
+
+									[message.symbol]:
+										{
+											...old,
+
+											price:
+												message.price,
+
+											volume:
+												message.volume,
+
+											timestamp:
+												message.timestamp,
+
+											firstPrice:
+												old.firstPrice ??
+												message.price,
+
+											history,
+										},
+								};
+							},
+						);
+					}
+				} catch (
+					error
+				) {
+					console.error(
+						"WebSocket message error:",
+						error,
+					);
+				}
+			},
+		});
 
 	useEffect(() => {
 		if (
-			symbols.length > 0 &&
-			!symbols.includes(selectedSymbol)
+			symbols.length >
+				0 &&
+			!symbols.includes(
+				selectedSymbol,
+			)
 		) {
-			setSelectedSymbol(symbols[0]);
+			setSelectedSymbol(
+				symbols[0],
+			);
 		}
-	}, [symbols, selectedSymbol]);
+	}, [
+		symbols,
+		selectedSymbol,
+	]);
 
 	const selected =
-		stocks[selectedSymbol] ??
-		createEmptyStock(selectedSymbol);
+		stocks[
+			selectedSymbol
+		] ??
+		createEmptyStock(
+			selectedSymbol,
+		);
 
-	const change = useMemo(() => {
-		if (
-			selected.price === null ||
-			selected.firstPrice === null
-		) {
+	const change =
+		useMemo(() => {
+			if (
+				selected.price ===
+					null ||
+				selected.firstPrice ===
+					null
+			) {
+				return {
+					value: null,
+					percent:
+						null,
+				};
+			}
+
+			const value =
+				selected.price -
+				selected.firstPrice;
+
+			const percent =
+				(value /
+					selected.firstPrice) *
+				100;
+
 			return {
-				value: null,
-				percent: null,
+				value,
+				percent,
 			};
-		}
-
-		const value =
-			selected.price -
-			selected.firstPrice;
-
-		const percent =
-			(value /
-				selected.firstPrice) *
-			100;
-
-		return {
-			value,
-			percent,
-		};
-	}, [selected]);
+		}, [selected]);
 
 	const positive =
-		change.value !== null &&
+		change.value !==
+			null &&
 		change.value >= 0;
 
 	function sendSymbols(
@@ -413,74 +649,113 @@ function App() {
 	) {
 		socket.send(
 			JSON.stringify({
-				type: "set_symbols",
-				symbols: nextSymbols,
+				type:
+					"set_symbols",
+
+				symbols:
+					nextSymbols,
 			}),
 		);
 	}
 
 	function addSymbol() {
-		setWatchlistError(null);
+		setWatchlistError(
+			null,
+		);
 
 		const symbol =
-			normalizeSymbol(newSymbol);
+			normalizeSymbol(
+				newSymbol,
+			);
 
 		if (!symbol) {
 			return;
 		}
 
-		if (!validSymbol(symbol)) {
+		if (
+			!validSymbol(
+				symbol,
+			)
+		) {
 			setWatchlistError(
 				"Neplatný ticker.",
 			);
-			return;
-		}
 
-		if (symbols.includes(symbol)) {
-			setWatchlistError(
-				`${symbol} už ve watchlistu je.`,
-			);
 			return;
 		}
 
 		if (
-			symbols.length >= maxSymbols
+			symbols.includes(
+				symbol,
+			)
+		) {
+			setWatchlistError(
+				`${symbol} už ve watchlistu je.`,
+			);
+
+			return;
+		}
+
+		if (
+			symbols.length >=
+			maxSymbols
 		) {
 			setWatchlistError(
 				`Maximum je ${maxSymbols} tickerů.`,
 			);
+
 			return;
 		}
 
-		const nextSymbols = [
-			...symbols,
+		const nextSymbols =
+			[
+				...symbols,
+				symbol,
+			];
+
+		setSymbols(
+			nextSymbols,
+		);
+
+		setStocks(
+			(previous) => ({
+				...previous,
+
+				[symbol]:
+					previous[
+						symbol
+					] ??
+					createEmptyStock(
+						symbol,
+					),
+			}),
+		);
+
+		setSelectedSymbol(
 			symbol,
-		];
+		);
 
-		setSymbols(nextSymbols);
-
-		setStocks((previous) => ({
-			...previous,
-			[symbol]:
-				previous[symbol] ??
-				createEmptyStock(symbol),
-		}));
-
-		setSelectedSymbol(symbol);
 		setNewSymbol("");
 
-		sendSymbols(nextSymbols);
+		sendSymbols(
+			nextSymbols,
+		);
 	}
 
 	function removeSymbol(
 		symbolToRemove: string,
 	) {
-		setWatchlistError(null);
+		setWatchlistError(
+			null,
+		);
 
-		if (symbols.length <= 1) {
+		if (
+			symbols.length <= 1
+		) {
 			setWatchlistError(
 				"Ve watchlistu musí zůstat alespoň jeden ticker.",
 			);
+
 			return;
 		}
 
@@ -491,7 +766,9 @@ function App() {
 					symbolToRemove,
 			);
 
-		setSymbols(nextSymbols);
+		setSymbols(
+			nextSymbols,
+		);
 
 		if (
 			selectedSymbol ===
@@ -502,21 +779,26 @@ function App() {
 			);
 		}
 
-		sendSymbols(nextSymbols);
+		sendSymbols(
+			nextSymbols,
+		);
 	}
 
 	const statusColor =
-		connectionStatus === "connected"
+		connectionStatus ===
+		"connected"
 			? "#22c55e"
 			: connectionStatus ===
 				  "disconnected"
 				? "#ef4444"
-				: connectionStatus === "error"
+				: connectionStatus ===
+					  "error"
 					? "#ef4444"
 					: "#f59e0b";
 
 	const statusText =
-		connectionStatus === "connected"
+		connectionStatus ===
+		"connected"
 			? "LIVE"
 			: connectionStatus ===
 				  "connecting"
@@ -529,9 +811,12 @@ function App() {
 	return (
 		<div
 			style={{
-				minHeight: "100vh",
-				background: "#020617",
-				color: "#e2e8f0",
+				minHeight:
+					"100vh",
+				background:
+					"#020617",
+				color:
+					"#e2e8f0",
 				fontFamily:
 					'Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
 			}}
@@ -541,49 +826,64 @@ function App() {
 					height: 64,
 					borderBottom:
 						"1px solid #1e293b",
-					display: "flex",
-					alignItems: "center",
+					display:
+						"flex",
+					alignItems:
+						"center",
 					justifyContent:
 						"space-between",
-					padding: "0 28px",
-					background: "#0f172a",
+					padding:
+						"0 28px",
+					background:
+						"#0f172a",
 				}}
 			>
 				<div>
 					<div
 						style={{
-							fontSize: 20,
-							fontWeight: 800,
+							fontSize:
+								20,
+							fontWeight:
+								800,
 						}}
 					>
-						Stocktrade Live
+						Stocktrade
+						Live
 					</div>
 
 					<div
 						style={{
-							fontSize: 12,
-							color: "#64748b",
+							fontSize:
+								12,
+							color:
+								"#64748b",
 						}}
 					>
-						Finnhub realtime
+						Finnhub
+						realtime
 						market feed
 					</div>
 				</div>
 
 				<div
 					style={{
-						fontSize: 13,
-						fontWeight: 700,
-						color: statusColor,
+						fontSize:
+							13,
+						fontWeight:
+							700,
+						color:
+							statusColor,
 					}}
 				>
-					● {statusText}
+					●{" "}
+					{statusText}
 				</div>
 			</header>
 
 			<div
 				style={{
-					display: "grid",
+					display:
+						"grid",
 					gridTemplateColumns:
 						"280px minmax(0, 1fr) 300px",
 					minHeight:
@@ -594,27 +894,36 @@ function App() {
 					style={{
 						borderRight:
 							"1px solid #1e293b",
-						background: "#0b1120",
-						padding: 18,
-						overflowY: "auto",
+						background:
+							"#0b1120",
+						padding:
+							18,
+						overflowY:
+							"auto",
 					}}
 				>
 					<div
 						style={{
-							display: "flex",
+							display:
+								"flex",
 							alignItems:
 								"center",
 							justifyContent:
 								"space-between",
-							marginBottom: 14,
+							marginBottom:
+								14,
 						}}
 					>
 						<div
 							style={{
-								fontSize: 12,
-								fontWeight: 700,
-								color: "#64748b",
-								letterSpacing: 1,
+								fontSize:
+									12,
+								fontWeight:
+									700,
+								color:
+									"#64748b",
+								letterSpacing:
+									1,
 							}}
 						>
 							WATCHLIST
@@ -622,73 +931,104 @@ function App() {
 
 						<div
 							style={{
-								fontSize: 11,
-								fontWeight: 700,
-								color: "#94a3b8",
+								fontSize:
+									11,
+								fontWeight:
+									700,
+								color:
+									"#94a3b8",
 							}}
 						>
-							{symbols.length} /{" "}
-							{maxSymbols}
+							{
+								symbols.length
+							}{" "}
+							/{" "}
+							{
+								maxSymbols
+							}
 						</div>
 					</div>
 
 					<div
 						style={{
-							display: "flex",
+							display:
+								"flex",
 							gap: 6,
-							marginBottom: 8,
+							marginBottom:
+								8,
 						}}
 					>
 						<input
-							value={newSymbol}
-							onChange={(event) =>
+							value={
+								newSymbol
+							}
+							onChange={(
+								event,
+							) =>
 								setNewSymbol(
-									event.target
+									event
+										.target
 										.value,
 								)
 							}
-							onKeyDown={(event) => {
+							onKeyDown={(
+								event,
+							) => {
 								if (
 									event.key ===
 									"Enter"
 								) {
 									event.preventDefault();
+
 									addSymbol();
 								}
 							}}
 							placeholder="TSLA"
-							maxLength={20}
+							maxLength={
+								20
+							}
 							style={{
 								flex: 1,
-								minWidth: 0,
+								minWidth:
+									0,
 								background:
 									"#020617",
 								border:
 									"1px solid #334155",
-								color: "#e2e8f0",
-								borderRadius: 7,
+								color:
+									"#e2e8f0",
+								borderRadius:
+									7,
 								padding:
 									"9px 10px",
-								fontWeight: 700,
+								fontWeight:
+									700,
 								textTransform:
 									"uppercase",
-								outline: "none",
+								outline:
+									"none",
 							}}
 						/>
 
 						<button
-							onClick={addSymbol}
+							onClick={
+								addSymbol
+							}
 							disabled={
 								symbols.length >=
 								maxSymbols
 							}
 							style={{
-								border: "none",
-								borderRadius: 7,
+								border:
+									"none",
+								borderRadius:
+									7,
 								background:
 									"#2563eb",
-								color: "white",
-								fontWeight: 800,
+								color:
+									"white",
+								fontWeight:
+									800,
 								padding:
 									"0 12px",
 								cursor:
@@ -710,18 +1050,26 @@ function App() {
 					{watchlistError && (
 						<div
 							style={{
-								fontSize: 11,
-								color: "#f87171",
-								marginBottom: 10,
-								lineHeight: 1.4,
+								fontSize:
+									11,
+								color:
+									"#f87171",
+								marginBottom:
+									10,
+								lineHeight:
+									1.4,
 							}}
 						>
-							{watchlistError}
+							{
+								watchlistError
+							}
 						</div>
 					)}
 
 					{symbols.map(
-						(symbol) => {
+						(
+							symbol,
+						) => {
 							const stock =
 								stocks[
 									symbol
@@ -742,7 +1090,8 @@ function App() {
 									style={{
 										position:
 											"relative",
-										marginBottom: 6,
+										marginBottom:
+											6,
 									}}
 								>
 									<button
@@ -752,9 +1101,12 @@ function App() {
 											)
 										}
 										style={{
-											width: "100%",
-											border: "none",
-											borderRadius: 8,
+											width:
+												"100%",
+											border:
+												"none",
+											borderRadius:
+												8,
 											background:
 												selectedRow
 													? "#1e293b"
@@ -787,7 +1139,8 @@ function App() {
 
 											<span
 												style={{
-													fontWeight: 700,
+													fontWeight:
+														700,
 												}}
 											>
 												{stock.price ===
@@ -801,10 +1154,12 @@ function App() {
 
 										<div
 											style={{
-												fontSize: 11,
+												fontSize:
+													11,
 												color:
 													"#64748b",
-												marginTop: 3,
+												marginTop:
+													3,
 											}}
 										>
 											{formatTime(
@@ -823,21 +1178,28 @@ function App() {
 										style={{
 											position:
 												"absolute",
-											right: 7,
-											top: 8,
-											width: 23,
-											height: 23,
+											right:
+												7,
+											top:
+												8,
+											width:
+												23,
+											height:
+												23,
 											border:
 												"none",
-											borderRadius: 6,
+											borderRadius:
+												6,
 											background:
 												"transparent",
 											color:
 												"#64748b",
 											cursor:
 												"pointer",
-											fontSize: 16,
-											lineHeight: 1,
+											fontSize:
+												16,
+											lineHeight:
+												1,
 										}}
 									>
 										×
@@ -850,8 +1212,10 @@ function App() {
 
 				<main
 					style={{
-						padding: "28px 32px",
-						minWidth: 0,
+						padding:
+							"28px 32px",
+						minWidth:
+							0,
 					}}
 				>
 					{serverError && (
@@ -861,35 +1225,46 @@ function App() {
 									"#450a0a",
 								border:
 									"1px solid #7f1d1d",
-								color: "#fecaca",
-								borderRadius: 8,
+								color:
+									"#fecaca",
+								borderRadius:
+									8,
 								padding:
 									"10px 14px",
-								marginBottom: 18,
-								fontSize: 13,
+								marginBottom:
+									18,
+								fontSize:
+									13,
 							}}
 						>
 							Finnhub:{" "}
-							{serverError}
+							{
+								serverError
+							}
 						</div>
 					)}
 
 					<div
 						style={{
-							display: "flex",
+							display:
+								"flex",
 							justifyContent:
 								"space-between",
 							alignItems:
 								"flex-start",
-							marginBottom: 28,
+							marginBottom:
+								28,
 						}}
 					>
 						<div>
 							<div
 								style={{
-									fontSize: 14,
-									color: "#64748b",
-									marginBottom: 6,
+									fontSize:
+										14,
+									color:
+										"#64748b",
+									marginBottom:
+										6,
 								}}
 							>
 								MARKET
@@ -897,8 +1272,10 @@ function App() {
 
 							<h1
 								style={{
-									fontSize: 32,
-									margin: 0,
+									fontSize:
+										32,
+									margin:
+										0,
 								}}
 							>
 								{
@@ -909,13 +1286,16 @@ function App() {
 
 						<div
 							style={{
-								textAlign: "right",
+								textAlign:
+									"right",
 							}}
 						>
 							<div
 								style={{
-									fontSize: 34,
-									fontWeight: 800,
+									fontSize:
+										34,
+									fontWeight:
+										800,
 								}}
 							>
 								{formatPrice(
@@ -925,9 +1305,12 @@ function App() {
 
 							<div
 								style={{
-									fontSize: 14,
-									fontWeight: 700,
-									marginTop: 4,
+									fontSize:
+										14,
+									fontWeight:
+										700,
+									marginTop:
+										4,
 									color:
 										change.value ===
 										null
@@ -953,9 +1336,12 @@ function App() {
 						style={{
 							border:
 								"1px solid #1e293b",
-							borderRadius: 12,
-							background: "#0f172a",
-							padding: 20,
+							borderRadius:
+								12,
+							background:
+								"#0f172a",
+							padding:
+								20,
 							color:
 								change.value ===
 								null
@@ -974,20 +1360,27 @@ function App() {
 
 					<div
 						style={{
-							display: "grid",
+							display:
+								"grid",
 							gridTemplateColumns:
 								"repeat(3, 1fr)",
 							gap: 14,
-							marginTop: 18,
+							marginTop:
+								18,
 						}}
 					>
-						<div style={statBox}>
+						<div
+							style={
+								statBox
+							}
+						>
 							<div
 								style={
 									statLabel
 								}
 							>
-								LAST PRICE
+								LAST
+								PRICE
 							</div>
 
 							<div
@@ -1001,13 +1394,18 @@ function App() {
 							</div>
 						</div>
 
-						<div style={statBox}>
+						<div
+							style={
+								statBox
+							}
+						>
 							<div
 								style={
 									statLabel
 								}
 							>
-								LAST VOLUME
+								LAST
+								VOLUME
 							</div>
 
 							<div
@@ -1020,13 +1418,18 @@ function App() {
 							</div>
 						</div>
 
-						<div style={statBox}>
+						<div
+							style={
+								statBox
+							}
+						>
 							<div
 								style={
 									statLabel
 								}
 							>
-								LAST TICK
+								LAST
+								TICK
 							</div>
 
 							<div
@@ -1046,17 +1449,24 @@ function App() {
 					style={{
 						borderLeft:
 							"1px solid #1e293b",
-						background: "#0b1120",
-						padding: 20,
+						background:
+							"#0b1120",
+						padding:
+							20,
 					}}
 				>
 					<div
 						style={{
-							fontSize: 12,
-							fontWeight: 700,
-							color: "#64748b",
-							letterSpacing: 1,
-							marginBottom: 18,
+							fontSize:
+								12,
+							fontWeight:
+								700,
+							color:
+								"#64748b",
+							letterSpacing:
+								1,
+							marginBottom:
+								18,
 						}}
 					>
 						TRADE PANEL
@@ -1064,20 +1474,29 @@ function App() {
 
 					<div
 						style={{
-							fontSize: 24,
-							fontWeight: 800,
-							marginBottom: 6,
+							fontSize:
+								24,
+							fontWeight:
+								800,
+							marginBottom:
+								6,
 						}}
 					>
-						{selectedSymbol}
+						{
+							selectedSymbol
+						}
 					</div>
 
 					<div
 						style={{
-							fontSize: 18,
-							fontWeight: 700,
-							color: "#94a3b8",
-							marginBottom: 20,
+							fontSize:
+								18,
+							fontWeight:
+								700,
+							color:
+								"#94a3b8",
+							marginBottom:
+								20,
 						}}
 					>
 						{formatPrice(
@@ -1089,7 +1508,8 @@ function App() {
 						disabled
 						style={{
 							...tradeButton,
-							background: "#166534",
+							background:
+								"#166534",
 						}}
 					>
 						BUY
@@ -1099,7 +1519,8 @@ function App() {
 						disabled
 						style={{
 							...tradeButton,
-							background: "#991b1b",
+							background:
+								"#991b1b",
 						}}
 					>
 						SELL
@@ -1107,16 +1528,20 @@ function App() {
 
 					<p
 						style={{
-							fontSize: 12,
-							color: "#64748b",
-							lineHeight: 1.6,
-							marginTop: 18,
+							fontSize:
+								12,
+							color:
+								"#64748b",
+							lineHeight:
+								1.6,
+							marginTop:
+								18,
 						}}
 					>
 						Obchodování je zatím
-						vypnuté. Tento panel nyní
-						slouží pouze jako náhled
-						budoucí funkce.
+						vypnuté. Tento panel
+						nyní slouží pouze jako
+						náhled budoucí funkce.
 					</p>
 				</aside>
 			</div>
@@ -1124,40 +1549,84 @@ function App() {
 	);
 }
 
-const statBox: React.CSSProperties = {
-	border: "1px solid #1e293b",
-	background: "#0f172a",
-	borderRadius: 10,
-	padding: 16,
-};
+const statBox: React.CSSProperties =
+	{
+		border:
+			"1px solid #1e293b",
 
-const statLabel: React.CSSProperties = {
-	fontSize: 11,
-	color: "#64748b",
-	fontWeight: 700,
-	letterSpacing: 0.8,
-	marginBottom: 8,
-};
+		background:
+			"#0f172a",
 
-const statValue: React.CSSProperties = {
-	fontSize: 18,
-	fontWeight: 800,
-};
+		borderRadius:
+			10,
 
-const tradeButton: React.CSSProperties = {
-	width: "100%",
-	border: "none",
-	color: "white",
-	fontWeight: 800,
-	fontSize: 15,
-	padding: "14px 18px",
-	borderRadius: 8,
-	marginBottom: 12,
-	opacity: 0.65,
-	cursor: "not-allowed",
-};
+		padding:
+			16,
+	};
+
+const statLabel: React.CSSProperties =
+	{
+		fontSize:
+			11,
+
+		color:
+			"#64748b",
+
+		fontWeight:
+			700,
+
+		letterSpacing:
+			0.8,
+
+		marginBottom:
+			8,
+	};
+
+const statValue: React.CSSProperties =
+	{
+		fontSize:
+			18,
+
+		fontWeight:
+			800,
+	};
+
+const tradeButton: React.CSSProperties =
+	{
+		width:
+			"100%",
+
+		border:
+			"none",
+
+		color:
+			"white",
+
+		fontWeight:
+			800,
+
+		fontSize:
+			15,
+
+		padding:
+			"14px 18px",
+
+		borderRadius:
+			8,
+
+		marginBottom:
+			12,
+
+		opacity:
+			0.65,
+
+		cursor:
+			"not-allowed",
+	};
 
 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
 createRoot(
-	document.getElementById("root")!,
+	document.getElementById(
+		"root",
+	)!,
 ).render(<App />);
