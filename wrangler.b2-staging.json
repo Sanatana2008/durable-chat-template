@@ -1,0 +1,24 @@
+{
+	"name": "durable-chat-template-b2-staging",
+	"main": "src/staging/index.ts",
+	"compatibility_date": "2025-10-08",
+	"workers_dev": true,
+	"migrations": [
+		{
+			"tag": "b2-staging-v1",
+			"new_sqlite_classes": ["B2StagingChat"]
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "B2StagingChat",
+				"class_name": "B2StagingChat"
+			}
+		]
+	},
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true
+}

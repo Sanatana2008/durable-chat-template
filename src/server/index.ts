@@ -12,10 +12,17 @@ const WATCHLIST_STORAGE_KEY = "watchlist_symbols";
 const PRICES_STORAGE_KEY = "latest_prices";
 const ALERTS_STORAGE_KEY = "price_alerts";
 const ALERT_STATES_STORAGE_KEY = "price_alert_states";
+const ALERT_RUNTIME_STORAGE_KEY = "alert_runtime_v2";
 
 const PRICE_SAVE_INTERVAL_MS = 60_000;
-
-const EMAIL = "k.bittner.k@gmail.com";
+const DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const DELIVERY_LEASE_MS = 2 * 60 * 1000;
+const DELIVERY_RETRY_DELAYS_MS = [
+	30_000,
+	2 * 60_000,
+	10 * 60_000,
+	30 * 60_000,
+];
 
 
 // ======================================================
@@ -55,6 +62,56 @@ type AlertZone =
 	| "below"
 	| "above";
 
+type DeliveryZone =
+	| "below"
+	| "above";
+
+type DeliveryStatus =
+	| "pending"
+	| "sending"
+	| "sent"
+	| "failed";
+
+type DeliveryRecord = {
+	triggerId: string;
+	symbol: string;
+	zone: DeliveryZone;
+	price: number;
+	boundary: number;
+	triggeredAt: number;
+	status: DeliveryStatus;
+	attempts: number;
+	nextRetryAt: number | null;
+	lastError: string | null;
+	lastAttemptAt: number | null;
+	completedAt: number | null;
+	leaseExpiresAt: number | null;
+	messageId: string | null;
+};
+
+type EmailSender = (
+	subject: string,
+	text: string,
+) => Promise<string>;
+
+type AlertRuntimeState = {
+	version: 2;
+	alertStates: Record<string, AlertZone>;
+	deliveries: Record<string, DeliveryRecord>;
+	nextTriggerSequence: number;
+};
+
+type AlertErrorCode =
+	| "unknown_symbol"
+	| "invalid_boundary"
+	| "invalid_value"
+	| "invalid_range"
+	| "not_found";
+
+type AlertCommand =
+	| "set_alert_boundary"
+	| "set_alert_enabled";
+
 type ClientMessage =
 	| {
 			type: "set_symbols";
@@ -75,6 +132,19 @@ type ClientMessage =
 			below: number | null;
 			above: number | null;
 			enabled?: boolean;
+	  }
+	| {
+			type: "set_alert_boundary";
+			symbol: string;
+			boundary: "below" | "above";
+			value: number | null;
+			requestId?: string;
+	  }
+	| {
+			type: "set_alert_enabled";
+			symbol: string;
+			enabled: boolean;
+			requestId?: string;
 	  }
 	| {
 			type: "delete_alert";
@@ -176,6 +246,21 @@ export class Chat extends Server<Env> {
 			AlertZone
 		>();
 
+	private deliveryRecords =
+		new Map<
+			string,
+			DeliveryRecord
+		>();
+
+	private nextTriggerSequence = 1;
+
+	protected emailSender: EmailSender = (
+		subject,
+		text,
+	) => this.sendEmail(subject, text);
+
+	private clock = () => Date.now();
+
 	// Ochrana proti několika současným
 	// e-mailům pro stejný ticker.
 	private alertProcessing =
@@ -199,11 +284,97 @@ export class Chat extends Server<Env> {
 	}
 
 
+	async onAlarm() {
+		await this.loadState();
+
+		const now = this.clock();
+		let runtimeChanged = false;
+		const recoveredDeliveries: DeliveryRecord[] = [];
+
+		for (const delivery of this.deliveryRecords.values()) {
+			if (
+				delivery.status !== "sending" ||
+				delivery.leaseExpiresAt === null ||
+				delivery.leaseExpiresAt > now
+			) {
+				continue;
+			}
+
+			delivery.leaseExpiresAt = null;
+			delivery.lastError =
+				"Delivery attempt interrupted before completion.";
+
+			if (delivery.attempts >= 5) {
+				delivery.status = "failed";
+				delivery.nextRetryAt = null;
+				delivery.completedAt = now;
+			} else {
+				delivery.status = "pending";
+				delivery.nextRetryAt = now;
+			}
+
+			recoveredDeliveries.push(
+				delivery,
+			);
+
+			runtimeChanged = true;
+		}
+
+		for (const [
+			triggerId,
+			delivery,
+		] of this.deliveryRecords) {
+			if (
+				(delivery.status === "sent" ||
+					delivery.status === "failed") &&
+				delivery.completedAt !== null &&
+				delivery.completedAt <=
+					now - DELIVERY_RETENTION_MS
+			) {
+				this.deliveryRecords.delete(
+					triggerId,
+				);
+				runtimeChanged = true;
+			}
+		}
+
+		if (runtimeChanged) {
+			await this.saveAlertStates();
+
+			for (const delivery of recoveredDeliveries) {
+				this.broadcastDeliveryStatus(
+					delivery,
+				);
+			}
+		}
+
+		const dueDeliveries =
+			Array.from(
+				this.deliveryRecords.values(),
+			).filter(
+				(delivery) =>
+					delivery.status === "pending" &&
+					(delivery.nextRetryAt === null ||
+						delivery.nextRetryAt <= now),
+			);
+
+		for (const delivery of dueDeliveries) {
+			await this.processDelivery(
+				delivery.triggerId,
+			);
+		}
+
+		await this.scheduleDeliveryAlarm(
+			this.clock(),
+		);
+	}
+
+
 	// ==================================================
 	// LOAD STATE
 	// ==================================================
 
-	private async loadState() {
+	protected async loadState() {
 		if (this.initialized) {
 			return;
 		}
@@ -543,6 +714,87 @@ export class Chat extends Server<Env> {
 		try {
 			const saved =
 				await this.ctx.storage.get<
+					AlertRuntimeState
+				>(
+					ALERT_RUNTIME_STORAGE_KEY,
+				);
+
+			if (saved?.version === 2) {
+				for (
+					const [
+						symbol,
+						zone,
+					]
+					of Object.entries(
+						saved.alertStates ?? {},
+					)
+				) {
+					if (
+						zone === "inside" ||
+						zone === "below" ||
+						zone === "above"
+					) {
+						this.alertStates.set(
+							symbol,
+							zone,
+						);
+					}
+				}
+
+				for (
+					const [
+						triggerId,
+						delivery,
+					]
+					of Object.entries(
+						saved.deliveries ?? {},
+					)
+				) {
+					if (
+						delivery &&
+						(
+							delivery.zone ===
+								"below" ||
+							delivery.zone ===
+								"above"
+						) &&
+						(
+							delivery.status ===
+								"pending" ||
+							delivery.status ===
+								"sending" ||
+							delivery.status ===
+								"sent" ||
+							delivery.status ===
+								"failed"
+						)
+					) {
+						this.deliveryRecords.set(
+						triggerId,
+						delivery,
+						);
+					}
+				}
+
+				if (
+					Number.isInteger(
+						saved.nextTriggerSequence,
+					) &&
+					saved.nextTriggerSequence > 0
+				) {
+					this.nextTriggerSequence =
+						saved.nextTriggerSequence;
+				}
+
+				console.log(
+					`Alert runtime restored: ${this.alertStates.size} states, ${this.deliveryRecords.size} deliveries`,
+				);
+
+				return;
+			}
+
+			const legacy =
+				await this.ctx.storage.get<
 					Record<
 						string,
 						AlertZone
@@ -551,33 +803,33 @@ export class Chat extends Server<Env> {
 					ALERT_STATES_STORAGE_KEY,
 				);
 
-			if (!saved) {
-				return;
-			}
-
-			for (
-				const [
-					symbol,
-					zone,
-				]
-				of Object.entries(
-					saved,
-				)
-			) {
-				if (
-					zone === "inside" ||
-					zone === "below" ||
-					zone === "above"
-				) {
-					this.alertStates.set(
+			if (legacy) {
+				for (
+					const [
 						symbol,
 						zone,
-					);
+					]
+					of Object.entries(
+						legacy,
+					)
+				) {
+					if (
+						zone === "inside" ||
+						zone === "below" ||
+						zone === "above"
+					) {
+						this.alertStates.set(
+							symbol,
+							zone,
+						);
+					}
 				}
+
+				await this.saveAlertStates();
 			}
 
 			console.log(
-				`Alert states restored: ${this.alertStates.size}`,
+				`Alert runtime restored: ${this.alertStates.size} states, 0 deliveries`,
 			);
 
 		} catch (error) {
@@ -591,7 +843,7 @@ export class Chat extends Server<Env> {
 
 	private async saveAlertStates() {
 		try {
-			const data: Record<
+			const alertStates: Record<
 				string,
 				AlertZone
 			> = {};
@@ -603,13 +855,35 @@ export class Chat extends Server<Env> {
 				]
 				of this.alertStates
 			) {
-				data[symbol] =
+				alertStates[symbol] =
 					zone;
 			}
 
+			const deliveries: Record<
+				string,
+				DeliveryRecord
+			> = {};
+
+			for (
+				const [
+					triggerId,
+					delivery,
+				]
+				of this.deliveryRecords
+			) {
+				deliveries[triggerId] =
+					delivery;
+			}
+
 			await this.ctx.storage.put(
-				ALERT_STATES_STORAGE_KEY,
-				data,
+				ALERT_RUNTIME_STORAGE_KEY,
+				{
+					version: 2,
+					alertStates,
+					deliveries,
+					nextTriggerSequence:
+						this.nextTriggerSequence,
+				} satisfies AlertRuntimeState,
 			);
 
 		} catch (error) {
@@ -617,6 +891,8 @@ export class Chat extends Server<Env> {
 				"Alert states save error:",
 				error,
 			);
+
+			throw error;
 		}
 	}
 
@@ -715,13 +991,22 @@ export class Chat extends Server<Env> {
 		subject: string,
 		text: string,
 	) {
+		const recipient =
+			this.env.ALERT_EMAIL_TO;
+
+		if (!recipient) {
+			throw new Error(
+				"Missing ALERT_EMAIL_TO secret.",
+			);
+		}
+
 		const accessToken =
 			await this.getGmailAccessToken();
 
 
 		const email =
-			`From: Stocktrade Alerts <${EMAIL}>\r\n` +
-			`To: ${EMAIL}\r\n` +
+			"From: Stocktrade Alerts\r\n" +
+			`To: ${recipient}\r\n` +
 			`Subject: ${subject}\r\n` +
 			`MIME-Version: 1.0\r\n` +
 			`Content-Type: text/plain; charset=UTF-8\r\n` +
@@ -993,6 +1278,575 @@ export class Chat extends Server<Env> {
 				this.createAlertsPayload(),
 			),
 		);
+	}
+
+
+	private createDeliveryStatusPayload(
+		delivery: DeliveryRecord,
+	) {
+		return {
+			type:
+				"alert_delivery_status",
+			symbol:
+				delivery.symbol,
+			zone:
+				delivery.zone,
+			triggerId:
+				delivery.triggerId,
+			status:
+				delivery.status,
+			attempts:
+				delivery.attempts,
+			nextRetryAt:
+				delivery.nextRetryAt,
+			lastError:
+				delivery.lastError,
+			triggeredAt:
+				delivery.triggeredAt,
+		};
+	}
+
+
+	private broadcastDeliveryStatus(
+		delivery: DeliveryRecord,
+	) {
+		this.broadcast(
+			JSON.stringify(
+				this.createDeliveryStatusPayload(
+					delivery,
+				),
+			),
+		);
+	}
+
+
+	private async scheduleDeliveryAlarm(
+		now: number,
+	) {
+		let nextAlarmAt:
+			| number
+			| null = null;
+
+		for (const delivery of this.deliveryRecords.values()) {
+			const candidate =
+				delivery.status === "pending"
+					? delivery.nextRetryAt ?? now
+					: delivery.status === "sending"
+						? delivery.leaseExpiresAt
+						: null;
+
+			if (candidate === null) {
+				continue;
+			}
+
+			const normalizedCandidate =
+				Math.max(candidate, now);
+
+			if (
+				nextAlarmAt === null ||
+				normalizedCandidate < nextAlarmAt
+			) {
+				nextAlarmAt = normalizedCandidate;
+			}
+		}
+
+		if (nextAlarmAt !== null) {
+			await this.ctx.storage.setAlarm(
+				nextAlarmAt,
+			);
+		}
+	}
+
+
+	private getErrorMessage(
+		error: unknown,
+	) {
+		return error instanceof Error
+			? error.message
+			: String(error);
+	}
+
+
+	private isRetryableEmailError(
+		error: unknown,
+	) {
+		const message =
+			this.getErrorMessage(
+				error,
+			);
+
+		return (
+			/HTTP (408|429|5\d\d)\b/.test(
+				message,
+			) ||
+			/Failed to fetch|NetworkError|network|timeout/i.test(
+				message,
+			)
+		);
+	}
+
+
+	private async processDelivery(
+		triggerId: string,
+	) {
+		const delivery =
+			this.deliveryRecords.get(
+				triggerId,
+			);
+
+		if (
+			!delivery ||
+			delivery.status !== "pending"
+		) {
+			return;
+		}
+
+		delivery.status = "sending";
+		delivery.attempts += 1;
+			delivery.lastAttemptAt =
+				this.clock();
+		delivery.leaseExpiresAt =
+			delivery.lastAttemptAt +
+			DELIVERY_LEASE_MS;
+		delivery.nextRetryAt = null;
+
+		await this.saveAlertStates();
+		this.broadcastDeliveryStatus(
+			delivery,
+		);
+
+		try {
+			const messageId =
+				await this.sendPriceAlertEmail(
+					delivery,
+				);
+
+			delivery.status = "sent";
+			delivery.lastError = null;
+			delivery.nextRetryAt = null;
+			delivery.leaseExpiresAt = null;
+			delivery.completedAt =
+				this.clock();
+			delivery.messageId =
+				messageId;
+
+			await this.saveAlertStates();
+			this.broadcastDeliveryStatus(
+				delivery,
+			);
+		} catch (error) {
+			const message =
+				this.getErrorMessage(
+					error,
+				);
+			const retryable =
+				this.isRetryableEmailError(
+					error,
+				);
+
+			if (
+				retryable &&
+				delivery.attempts < 5
+			) {
+				delivery.status = "pending";
+					delivery.nextRetryAt =
+					this.clock() +
+					(
+						DELIVERY_RETRY_DELAYS_MS[
+							delivery.attempts - 1
+						] ??
+						DELIVERY_RETRY_DELAYS_MS[
+							DELIVERY_RETRY_DELAYS_MS.length -
+								1
+						]
+					);
+				delivery.completedAt = null;
+			} else {
+				delivery.status = "failed";
+				delivery.nextRetryAt = null;
+				delivery.completedAt =
+					this.clock();
+			}
+
+			delivery.lastError = message;
+			delivery.leaseExpiresAt = null;
+
+			await this.saveAlertStates();
+			this.broadcastDeliveryStatus(
+				delivery,
+			);
+
+			this.broadcast(
+				JSON.stringify({
+					type:
+						"alert_email_error",
+					symbol:
+						delivery.symbol,
+					price:
+						delivery.price,
+					zone:
+						delivery.zone,
+					message,
+				}),
+			);
+		}
+	}
+
+
+	private sendAlertError(
+		connection: Connection,
+		symbol: string,
+		code: AlertErrorCode,
+		message: string,
+		requestId?: string,
+	) {
+		connection.send(
+			JSON.stringify({
+				type: "alert_error",
+				requestId,
+				symbol,
+				code,
+				message,
+			}),
+		);
+	}
+
+
+	private sendAlertCommandAck(
+		connection: Connection,
+		requestId: string,
+		symbol: string,
+		command: AlertCommand,
+	) {
+		connection.send(
+			JSON.stringify({
+				type: "alert_command_ack",
+				requestId,
+				symbol,
+				command,
+			}),
+		);
+	}
+
+
+	private async setAlertBoundary(
+		connection: Connection,
+		symbolRaw: string,
+		boundaryRaw: "below" | "above",
+		value: number | null,
+		requestId?: string,
+	) {
+		const symbol =
+			symbolRaw
+				.trim()
+				.toUpperCase();
+
+		if (
+			!this.symbols.has(
+				symbol,
+			)
+		) {
+			this.sendAlertError(
+				connection,
+				symbol,
+				"unknown_symbol",
+				`Alert ignored: ${symbol} is not in watchlist`,
+				requestId,
+			);
+
+			return;
+		}
+
+		if (
+			boundaryRaw !== "below" &&
+			boundaryRaw !== "above"
+		) {
+			this.sendAlertError(
+				connection,
+				symbol,
+				"invalid_boundary",
+				`Invalid boundary: ${String(
+					boundaryRaw,
+				)}`,
+				requestId,
+			);
+
+			return;
+		}
+
+		const currentAlert =
+			this.alerts.get(
+				symbol,
+			);
+
+		if (!currentAlert) {
+			this.sendAlertError(
+				connection,
+				symbol,
+				"not_found",
+				`Alert not found for ${symbol}`,
+				requestId,
+			);
+
+			return;
+		}
+
+		const nextAlert: PriceAlert = {
+			symbol,
+			below:
+				currentAlert.below,
+			above:
+				currentAlert.above,
+			enabled:
+				currentAlert.enabled,
+		};
+
+		if (
+			value === null
+		) {
+			if (
+				boundaryRaw ===
+				"below"
+			) {
+				nextAlert.below =
+					null;
+			} else {
+				nextAlert.above =
+					null;
+			}
+		} else {
+			if (
+				typeof value !==
+					"number" ||
+				!Number.isFinite(
+					value,
+				) ||
+				value <= 0
+			) {
+				this.sendAlertError(
+					connection,
+					symbol,
+					"invalid_value",
+					`Invalid boundary value for ${symbol}: ${String(
+						value,
+					)}`,
+					requestId,
+				);
+
+				return;
+			}
+
+			if (
+				boundaryRaw ===
+				"below"
+			) {
+				nextAlert.below =
+					value;
+			} else {
+				nextAlert.above =
+					value;
+			}
+		}
+
+		if (
+			nextAlert.below === null &&
+			nextAlert.above === null
+		) {
+			this.alerts.delete(
+				symbol,
+			);
+
+			this.alertStates.delete(
+				symbol,
+			);
+
+			await this.saveAlerts();
+			await this.saveAlertStates();
+			this.broadcastAlerts();
+
+			if (requestId) {
+				this.sendAlertCommandAck(
+					connection,
+					requestId,
+					symbol,
+					"set_alert_boundary",
+				);
+			}
+
+			return;
+		}
+
+		if (
+			nextAlert.below !== null &&
+			nextAlert.above !== null &&
+			nextAlert.below >=
+				nextAlert.above
+		) {
+			this.sendAlertError(
+				connection,
+				symbol,
+				"invalid_range",
+				`Invalid alert range for ${symbol}: below=${nextAlert.below}, above=${nextAlert.above}`,
+				requestId,
+			);
+
+			return;
+		}
+
+		this.alerts.set(
+			symbol,
+			nextAlert,
+		);
+
+		const latest =
+			this.latestTrades.get(
+				symbol,
+			);
+
+		if (latest) {
+			const currentZone =
+				this.getAlertZone(
+					nextAlert,
+					latest.price,
+				);
+
+			this.alertStates.set(
+				symbol,
+				currentZone,
+			);
+		} else {
+			this.alertStates.delete(
+				symbol,
+			);
+		}
+
+		await this.saveAlerts();
+		await this.saveAlertStates();
+		this.broadcastAlerts();
+
+		if (requestId) {
+			this.sendAlertCommandAck(
+				connection,
+				requestId,
+				symbol,
+				"set_alert_boundary",
+			);
+		}
+	}
+
+
+	private async setAlertEnabled(
+		connection: Connection,
+		symbolRaw: string,
+		enabled: boolean,
+		requestId?: string,
+	) {
+		const symbol =
+			symbolRaw
+				.trim()
+				.toUpperCase();
+
+		if (
+			!this.symbols.has(
+				symbol,
+			)
+		) {
+			this.sendAlertError(
+				connection,
+				symbol,
+				"unknown_symbol",
+				`Alert ignored: ${symbol} is not in watchlist`,
+				requestId,
+			);
+
+			return;
+		}
+
+		const currentAlert =
+			this.alerts.get(
+				symbol,
+			);
+
+		if (!currentAlert) {
+			this.sendAlertError(
+				connection,
+				symbol,
+				"not_found",
+				`Alert not found for ${symbol}`,
+				requestId,
+			);
+
+			return;
+		}
+
+		const nextAlert: PriceAlert = {
+			symbol,
+			below:
+				currentAlert.below,
+			above:
+				currentAlert.above,
+			enabled,
+		};
+
+		this.alerts.set(
+			symbol,
+			nextAlert,
+		);
+
+		if (!enabled) {
+			this.alertStates.delete(
+				symbol,
+			);
+			await this.saveAlerts();
+			await this.saveAlertStates();
+			this.broadcastAlerts();
+
+			if (requestId) {
+				this.sendAlertCommandAck(
+					connection,
+					requestId,
+					symbol,
+					"set_alert_enabled",
+				);
+			}
+
+			return;
+		}
+
+		const latest =
+			this.latestTrades.get(
+				symbol,
+			);
+
+		if (latest) {
+			const currentZone =
+				this.getAlertZone(
+					nextAlert,
+					latest.price,
+				);
+
+			this.alertStates.set(
+				symbol,
+				currentZone,
+			);
+		} else {
+			this.alertStates.delete(
+				symbol,
+			);
+		}
+
+		await this.saveAlerts();
+		await this.saveAlertStates();
+		this.broadcastAlerts();
+
+		if (requestId) {
+			this.sendAlertCommandAck(
+				connection,
+				requestId,
+				symbol,
+				"set_alert_enabled",
+			);
+		}
 	}
 
 
@@ -1293,49 +2147,41 @@ export class Chat extends Server<Env> {
 	// ==================================================
 
 	private async sendPriceAlertEmail(
-		alert: PriceAlert,
-		trade: LatestTrade,
-		zone:
-			| "below"
-			| "above",
+		delivery: DeliveryRecord,
 	) {
-		const boundary =
-			zone === "below"
-				? alert.below
-				: alert.above;
-
-
 		const directionText =
-			zone === "below"
+			delivery.zone === "below"
 				? "klesl pod nastavenou hranici"
 				: "vzrostl nad nastavenou hranici";
 
 
 		const subject =
-			`Stocktrade Alert - ${trade.symbol}`;
+			`Stocktrade Alert - ${delivery.symbol}`;
 
 
 		const text =
 			"Stocktrade Alerts\n\n" +
 
-			`${trade.symbol} ${directionText}.\n\n` +
+			`${delivery.symbol} ${directionText}.\n\n` +
 
-			`Aktuální cena: ${trade.price} USD\n` +
+			`Aktuální cena: ${delivery.price} USD\n` +
 
-			`Hranice: ${boundary} USD\n` +
+			`Hranice: ${delivery.boundary} USD\n` +
 
-			`Směr: ${zone.toUpperCase()}\n\n` +
+			`Směr: ${delivery.zone.toUpperCase()}\n\n` +
 
 			`Čas trhu: ${new Date(
-				trade.timestamp,
+				delivery.triggeredAt,
 			).toISOString()}\n` +
 
-			`Odesláno: ${new Date().toISOString()}\n\n` +
+			`Odesláno: ${new Date(
+				this.clock(),
+			).toISOString()}\n\n` +
 
 			"Stocktrade Live";
 
 
-		return await this.sendEmail(
+		return await this.emailSender(
 			subject,
 			text,
 		);
@@ -1480,6 +2326,10 @@ export class Chat extends Server<Env> {
 					? alert.below
 					: alert.above;
 
+			if (boundary === null) {
+				return;
+			}
+
 
 			const alertPayload = {
 				type:
@@ -1509,99 +2359,82 @@ export class Chat extends Server<Env> {
 			);
 
 
-			// ==================================================
-			// 1. NEJDŘÍVE GMAIL
-			// ==================================================
-			//
-			// Pokud Gmail selže:
-			// alertStates se NEZMĚNÍ.
-			// Další tick se tedy může pokusit znovu.
+			const triggerId =
+				`${trade.symbol}:${this.nextTriggerSequence}`;
 
-			try {
-				const gmailMessageId =
-					await this.sendPriceAlertEmail(
-						alert,
-						trade,
-						newZone,
-					);
+			this.nextTriggerSequence += 1;
+			this.alertStates.set(
+				trade.symbol,
+				newZone,
+			);
 
+			const delivery: DeliveryRecord = {
+				triggerId,
+				symbol: trade.symbol,
+				zone: newZone,
+				price: trade.price,
+				boundary,
+				triggeredAt: trade.timestamp,
+				status: "pending",
+				attempts: 0,
+				nextRetryAt: null,
+				lastError: null,
+				lastAttemptAt: null,
+				completedAt: null,
+				leaseExpiresAt: null,
+				messageId: null,
+			};
 
-				console.log(
-					"EMAIL ALERT SENT:",
-					JSON.stringify(
-						alertPayload,
-					),
-				);
+			this.deliveryRecords.set(
+				triggerId,
+				delivery,
+			);
 
+			await this.saveAlertStates();
+			await this.ctx.storage.setAlarm(
+				this.clock(),
+			);
 
-				console.log(
-					"Gmail Message ID:",
-					gmailMessageId,
-				);
-
-
-				// ==================================================
-				// 2. GMAIL USPĚL → TEPRVE TEĎ ULOŽÍME ZÓNU
-				// ==================================================
-
-				this.alertStates.set(
-					trade.symbol,
-					newZone,
-				);
-
-
-				await this.saveAlertStates();
-
-
-				// A až potom oznámíme alert klientovi.
-
-				this.broadcast(
-					JSON.stringify(
-						alertPayload,
-					),
-				);
-
-			} catch (error) {
-				console.error(
-					"EMAIL ALERT ERROR:",
-					error instanceof Error
-						? error.message
-						: String(error),
-				);
-
-
-				this.broadcast(
-					JSON.stringify({
-						type:
-							"alert_email_error",
-
-						symbol:
-							trade.symbol,
-
-						price:
-							trade.price,
-
-						zone:
-							newZone,
-
-						message:
-							error instanceof Error
-								? error.message
-								: String(
-										error,
-									),
-					}),
-				);
-
-
-				// Záměrně zde NEMĚNÍME alertStates.
-			}
+			this.broadcast(
+				JSON.stringify(
+					alertPayload,
+				),
+			);
+			this.broadcastDeliveryStatus(
+				delivery,
+			);
 
 		} finally {
 			this.alertProcessing.delete(
 				trade.symbol,
 			);
 		}
+	}
+
+
+	protected async handleTrade(
+		latest: LatestTrade,
+		conditions: string[] = [],
+	) {
+		this.latestTrades.set(
+			latest.symbol,
+			latest,
+		);
+
+		this.schedulePriceSave();
+
+		this.broadcast(
+			JSON.stringify({
+				type:
+					"trade",
+				...latest,
+				conditions,
+			}),
+		);
+
+		await this.processPriceAlert(
+			latest,
+		);
 	}
 
 
@@ -1764,36 +2597,10 @@ export class Chat extends Server<Env> {
 								};
 
 
-							this.latestTrades.set(
-								trade.s,
+							void this.handleTrade(
 								latest,
-							);
-
-
-							this.schedulePriceSave();
-
-
-							const payload = {
-								type:
-									"trade",
-
-								...latest,
-
-								conditions:
-									trade.c ??
+								trade.c ??
 									[],
-							};
-
-
-							this.broadcast(
-								JSON.stringify(
-									payload,
-								),
-							);
-
-
-							void this.processPriceAlert(
-								latest,
 							);
 						}
 
@@ -2099,6 +2906,37 @@ export class Chat extends Server<Env> {
 						true,
 				);
 
+
+				return;
+			}
+
+
+			if (
+				message.type ===
+				"set_alert_boundary"
+			) {
+				await this.setAlertBoundary(
+					connection,
+					message.symbol,
+					message.boundary,
+					message.value,
+					message.requestId,
+				);
+
+				return;
+			}
+
+
+			if (
+				message.type ===
+				"set_alert_enabled"
+			) {
+				await this.setAlertEnabled(
+					connection,
+					message.symbol,
+					message.enabled,
+					message.requestId,
+				);
 
 				return;
 			}
