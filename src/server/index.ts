@@ -94,6 +94,27 @@ type EmailSender = (
 	text: string,
 ) => Promise<string>;
 
+type EmailErrorCode =
+	| "gmail_oauth_configuration"
+	| "gmail_token_request_failed"
+	| "gmail_token_response_invalid"
+	| "gmail_recipient_configuration"
+	| "gmail_send_request_failed"
+	| "gmail_send_response_invalid"
+	| "email_delivery_temporarily_unavailable"
+	| "email_delivery_failed";
+
+class EmailDeliveryError extends Error {
+	constructor(
+		readonly code: EmailErrorCode,
+		message: string,
+		readonly retryable: boolean,
+		readonly httpStatus?: number,
+	) {
+		super(message);
+	}
+}
+
 type AlertRuntimeState = {
 	version: 2;
 	alertStates: Record<string, AlertZone>;
@@ -917,14 +938,16 @@ export class Chat extends Server<Env> {
 			!clientSecret ||
 			!refreshToken
 		) {
-			throw new Error(
+			throw new EmailDeliveryError(
+				"gmail_oauth_configuration",
 				"Missing Gmail OAuth secrets.",
+				false,
 			);
 		}
 
-
-		const response =
-			await fetch(
+		let response: Response;
+		try {
+			response = await fetch(
 				"https://oauth2.googleapis.com/token",
 				{
 					method:
@@ -951,30 +974,66 @@ export class Chat extends Server<Env> {
 						}),
 				},
 			);
-
-
-		const data =
-			await response.json() as {
-				access_token?: string;
-				error?: string;
-				error_description?: string;
-			};
-
+			} catch {
+				this.logEmailFailure(
+					"gmail_token_request",
+					"gmail_token_request_failed",
+				);
+				throw new EmailDeliveryError(
+					"gmail_token_request_failed",
+					"Email delivery temporarily unavailable.",
+					true,
+				);
+			}
 
 		if (!response.ok) {
-			throw new Error(
-				`Google OAuth HTTP ${response.status}: ${JSON.stringify(
-					data,
-				)}`,
+				const retryable =
+					this.isRetryableHttpStatus(
+						response.status,
+					);
+				this.logEmailFailure(
+					"gmail_token_request",
+					"gmail_token_request_failed",
+					response.status,
+				);
+				throw new EmailDeliveryError(
+					"gmail_token_request_failed",
+					retryable
+						? "Email delivery temporarily unavailable."
+						: "Gmail token request failed.",
+					retryable,
+					response.status,
 			);
 		}
 
+			let data: { access_token?: string };
+			try {
+				data = await response.json() as {
+					access_token?: string;
+				};
+			} catch {
+				this.logEmailFailure(
+					"gmail_token_response",
+					"gmail_token_response_invalid",
+				);
+				throw new EmailDeliveryError(
+					"gmail_token_response_invalid",
+					"Gmail token request failed.",
+					false,
+				);
+			}
 
 		if (
 			!data.access_token
 		) {
-			throw new Error(
-				"Google OAuth nevrátil access token.",
+				this.logEmailFailure(
+					"gmail_token_response",
+					"gmail_token_response_invalid",
+				);
+				throw new EmailDeliveryError(
+					"gmail_token_response_invalid",
+					"Gmail token request failed.",
+					false,
 			);
 		}
 
@@ -987,7 +1046,7 @@ export class Chat extends Server<Env> {
 	// GMAIL SEND
 	// ==================================================
 
-	private async sendEmail(
+	protected async sendEmail(
 		subject: string,
 		text: string,
 	) {
@@ -995,8 +1054,10 @@ export class Chat extends Server<Env> {
 			this.env.ALERT_EMAIL_TO;
 
 		if (!recipient) {
-			throw new Error(
+			throw new EmailDeliveryError(
+				"gmail_recipient_configuration",
 				"Missing ALERT_EMAIL_TO secret.",
+				false,
 			);
 		}
 
@@ -1019,8 +1080,9 @@ export class Chat extends Server<Env> {
 			toBase64Url(email);
 
 
-		const response =
-			await fetch(
+		let response: Response;
+		try {
+			response = await fetch(
 				"https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
 				{
 					method:
@@ -1040,27 +1102,64 @@ export class Chat extends Server<Env> {
 						}),
 				},
 			);
-
-
-		const data =
-			await response.json() as {
-				id?: string;
-				error?: unknown;
-			};
-
+			} catch {
+				this.logEmailFailure(
+					"gmail_send",
+					"gmail_send_request_failed",
+				);
+				throw new EmailDeliveryError(
+					"gmail_send_request_failed",
+					"Email delivery temporarily unavailable.",
+					true,
+				);
+			}
 
 		if (!response.ok) {
-			throw new Error(
-				`Gmail API HTTP ${response.status}: ${JSON.stringify(
-					data,
-				)}`,
+				const retryable =
+					this.isRetryableHttpStatus(
+						response.status,
+					);
+				this.logEmailFailure(
+					"gmail_send",
+					"gmail_send_request_failed",
+					response.status,
+				);
+				throw new EmailDeliveryError(
+					"gmail_send_request_failed",
+					retryable
+						? "Email delivery temporarily unavailable."
+						: "Gmail send request failed.",
+					retryable,
+					response.status,
 			);
 		}
 
+			let data: { id?: string };
+			try {
+				data = await response.json() as {
+					id?: string;
+				};
+			} catch {
+				this.logEmailFailure(
+					"gmail_send_response",
+					"gmail_send_response_invalid",
+				);
+				throw new EmailDeliveryError(
+					"gmail_send_response_invalid",
+					"Gmail send request failed.",
+					false,
+				);
+			}
 
 		if (!data.id) {
-			throw new Error(
-				"Gmail API nevrátil Message ID.",
+				this.logEmailFailure(
+					"gmail_send_response",
+					"gmail_send_response_invalid",
+				);
+				throw new EmailDeliveryError(
+					"gmail_send_response_invalid",
+					"Gmail send request failed.",
+					false,
 			);
 		}
 
@@ -1358,30 +1457,60 @@ export class Chat extends Server<Env> {
 	}
 
 
-	private getErrorMessage(
-		error: unknown,
+	private logEmailFailure(
+		operation: string,
+		code: EmailErrorCode,
+		httpStatus?: number,
 	) {
-		return error instanceof Error
-			? error.message
-			: String(error);
+		console.error(
+			"Email delivery failure",
+			{
+				operation,
+				code,
+				httpStatus,
+			},
+		);
 	}
 
 
-	private isRetryableEmailError(
+	private isRetryableHttpStatus(
+		httpStatus: number,
+	) {
+		return (
+			httpStatus === 408 ||
+			httpStatus === 429 ||
+			httpStatus >= 500
+		);
+	}
+
+
+	private toPublicEmailError(
 		error: unknown,
 	) {
-		const message =
-			this.getErrorMessage(
-				error,
-			);
+		if (error instanceof EmailDeliveryError) {
+			return error;
+		}
 
-		return (
+		const message =
+			error instanceof Error
+				? error.message
+				: String(error);
+		const retryable =
 			/HTTP (408|429|5\d\d)\b/.test(
 				message,
 			) ||
 			/Failed to fetch|NetworkError|network|timeout/i.test(
 				message,
-			)
+			);
+
+		return new EmailDeliveryError(
+			retryable
+				? "email_delivery_temporarily_unavailable"
+				: "email_delivery_failed",
+			retryable
+				? "Email delivery temporarily unavailable."
+				: "Email delivery failed.",
+			retryable,
 		);
 	}
 
@@ -1435,14 +1564,14 @@ export class Chat extends Server<Env> {
 				delivery,
 			);
 		} catch (error) {
+			const deliveryError =
+				this.toPublicEmailError(
+					error,
+				);
 			const message =
-				this.getErrorMessage(
-					error,
-				);
+				deliveryError.message;
 			const retryable =
-				this.isRetryableEmailError(
-					error,
-				);
+				deliveryError.retryable;
 
 			if (
 				retryable &&
@@ -1486,6 +1615,8 @@ export class Chat extends Server<Env> {
 						delivery.price,
 					zone:
 						delivery.zone,
+					code:
+						deliveryError.code,
 					message,
 				}),
 			);

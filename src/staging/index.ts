@@ -8,7 +8,8 @@ import { Chat } from "../server/index";
 type EmailMode =
 	| "success"
 	| "retryable_failure"
-	| "permanent_failure";
+	| "permanent_failure"
+	| "real_gmail";
 
 type ControlMessage = {
 	action:
@@ -96,7 +97,8 @@ function validateControlMessage(
 		if (
 			candidate.mode !== "success" &&
 			candidate.mode !== "retryable_failure" &&
-			candidate.mode !== "permanent_failure"
+			candidate.mode !== "permanent_failure" &&
+			candidate.mode !== "real_gmail"
 		) {
 			return "Invalid email mode";
 		}
@@ -233,7 +235,7 @@ export class B2StagingChat extends Chat {
 	) {
 		super(ctx, env);
 
-		this.emailSender = async () => {
+		this.emailSender = async (subject, text) => {
 			const mode =
 				await this.ctx.storage.get<EmailMode>(
 					EMAIL_MODE_KEY,
@@ -249,6 +251,10 @@ export class B2StagingChat extends Chat {
 				throw new Error(
 					"Gmail API HTTP 400: staging failure",
 				);
+			}
+
+			if (mode === "real_gmail") {
+				return this.sendEmail(subject, text);
 			}
 
 			return "b2-staging-message";

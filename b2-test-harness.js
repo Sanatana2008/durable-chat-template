@@ -90,7 +90,7 @@ async function createHarness({ storage = new FakeStorage(), now = 1_000_000, out
     if (outcome.type === 'success') {
       return outcome.messageId ?? `fake-message-${emailCalls}`;
     }
-    throw new Error(`Gmail API HTTP ${outcome.status}: fake failure`);
+    throw new Error(outcome.message ?? `Gmail API HTTP ${outcome.status}: fake failure`);
   };
 
   if (initialize) {
@@ -440,6 +440,54 @@ await expectScenario('B2-16 network protection blocks real IO', async () => {
   assert.equal(realFetchCalls, 0);
   assert.equal(finnhubWebSocketConstructions, 0);
   assert.ok(fakeEmailCalls > 0);
+});
+
+await expectScenario('B2-17 retryable provider details are sanitized', async () => {
+  const rawProviderBody = '{"error":"backend_failure","access_token":"do-not-broadcast"}';
+  const harness = await createHarness({
+    outcomes: [{ type: 'retryable-error', status: 503, message: `Gmail API HTTP 503: ${rawProviderBody}` }],
+  });
+  await configureAlert(harness);
+  await trade(harness, 110);
+  await trade(harness, 130, harness.now + 1);
+  const triggerId = deliveries(await runtime(harness))[0].triggerId;
+  await harness.chat.onAlarm();
+  const record = deliveryFor(await runtime(harness), triggerId);
+  const status = eventsOf(harness, 'alert_delivery_status').at(-1);
+  const emailError = eventsOf(harness, 'alert_email_error').at(-1);
+
+  assert.equal(record.status, 'pending');
+  assert.equal(record.nextRetryAt, harness.now + 30_000);
+  assert.equal(record.lastError, 'Email delivery temporarily unavailable.');
+  assert.equal(status.lastError, 'Email delivery temporarily unavailable.');
+  assert.equal(emailError.message, 'Email delivery temporarily unavailable.');
+  assert.equal(emailError.code, 'email_delivery_temporarily_unavailable');
+  assert.equal(JSON.stringify({ record, status, emailError }).includes(rawProviderBody), false);
+  assert.equal(JSON.stringify({ record, status, emailError }).includes('do-not-broadcast'), false);
+});
+
+await expectScenario('B2-18 permanent provider details are sanitized', async () => {
+  const rawProviderBody = '{"error":"invalid_grant","refresh_token":"do-not-broadcast"}';
+  const harness = await createHarness({
+    outcomes: [{ type: 'permanent-error', status: 400, message: `Gmail API HTTP 400: ${rawProviderBody}` }],
+  });
+  await configureAlert(harness);
+  await trade(harness, 110);
+  await trade(harness, 130, harness.now + 1);
+  const triggerId = deliveries(await runtime(harness))[0].triggerId;
+  await harness.chat.onAlarm();
+  const record = deliveryFor(await runtime(harness), triggerId);
+  const status = eventsOf(harness, 'alert_delivery_status').at(-1);
+  const emailError = eventsOf(harness, 'alert_email_error').at(-1);
+
+  assert.equal(record.status, 'failed');
+  assert.equal(record.nextRetryAt, null);
+  assert.equal(record.lastError, 'Email delivery failed.');
+  assert.equal(status.lastError, 'Email delivery failed.');
+  assert.equal(emailError.message, 'Email delivery failed.');
+  assert.equal(emailError.code, 'email_delivery_failed');
+  assert.equal(JSON.stringify({ record, status, emailError }).includes(rawProviderBody), false);
+  assert.equal(JSON.stringify({ record, status, emailError }).includes('do-not-broadcast'), false);
 });
 
 console.log(`PASS B2 deterministic harness; fake email calls = ${fakeEmailCalls}`);
