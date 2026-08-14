@@ -15,6 +15,7 @@ const ALERT_STATES_STORAGE_KEY = "price_alert_states";
 const ALERT_RUNTIME_STORAGE_KEY = "alert_runtime_v2";
 
 const PRICE_SAVE_INTERVAL_MS = 60_000;
+const ALERT_COOLDOWN_MS = 5 * 60 * 1000;
 const DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DELIVERY_LEASE_MS = 2 * 60 * 1000;
 const DELIVERY_RETRY_DELAYS_MS = [
@@ -2458,6 +2459,34 @@ export class Chat extends Server<Env> {
 					: alert.above;
 
 			if (boundary === null) {
+				return;
+			}
+
+			const cooldownCutoff =
+				this.clock() - ALERT_COOLDOWN_MS;
+
+			const recentSameZoneDelivery =
+				Array.from(
+					this.deliveryRecords.values(),
+				).some(
+					(delivery) =>
+						delivery.symbol === trade.symbol &&
+						delivery.zone === newZone &&
+						delivery.triggeredAt >= cooldownCutoff,
+				);
+
+			if (recentSameZoneDelivery) {
+				this.alertStates.set(
+					trade.symbol,
+					newZone,
+				);
+
+				await this.saveAlertStates();
+
+				console.log(
+					`${trade.symbol}: alert suppressed by 5-minute cooldown (${newZone})`,
+				);
+
 				return;
 			}
 
