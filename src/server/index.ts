@@ -1256,6 +1256,71 @@ export class Chat extends Server<Env> {
 	}
 
 
+    private async loadInitialQuote(symbol: string) {
+        if (this.latestTrades.has(symbol)) {
+            return;
+        }
+
+        const apiKey = this.env.FINNHUB_API_KEY;
+
+        if (!apiKey) {
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(apiKey)}`,
+            );
+
+            if (!response.ok) {
+                console.warn(
+                    `Finnhub quote fallback failed for ${symbol}: HTTP ${response.status}`,
+                );
+                return;
+            }
+
+            const quote = await response.json() as {
+                c?: number;
+                t?: number;
+            };
+
+            if (
+                typeof quote.c !== "number" ||
+                !Number.isFinite(quote.c) ||
+                quote.c <= 0
+            ) {
+                console.warn(
+                    `Finnhub quote fallback returned no usable price for ${symbol}`,
+                );
+                return;
+            }
+
+            const timestamp =
+                typeof quote.t === "number" &&
+                Number.isFinite(quote.t) &&
+                quote.t > 0
+                    ? quote.t * 1000
+                    : this.clock();
+
+            await this.handleTrade({
+                symbol,
+                price: quote.c,
+                volume: 0,
+                timestamp,
+            });
+
+            console.log(
+                `Finnhub quote fallback loaded: ${symbol} = ${quote.c}`,
+            );
+        } catch (error) {
+            console.error(
+                `Finnhub quote fallback error for ${symbol}:`,
+                error,
+            );
+        }
+    }
+
+
 	private subscribeAll() {
 		for (
 			const symbol
@@ -1265,6 +1330,8 @@ export class Chat extends Server<Env> {
 				"subscribe",
 				symbol,
 			);
+
+			void this.loadInitialQuote(symbol);
 		}
 	}
 
